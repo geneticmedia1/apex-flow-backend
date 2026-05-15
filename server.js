@@ -6,11 +6,21 @@ app.use(express.json());
 
 app.post("/webhook", (req, res) => {
 
+    const SECRET = "Tbot Automate HWR Pro";
+
+    // CHECK SECRET
+    if (req.body.secret !== SECRET) {
+
+        console.log("INVALID SECRET");
+
+        return res.status(403).send("Forbidden");
+    }
+
     // RESPOND IMMEDIATELY
     res.sendStatus(200);
 
     // LOG AFTER RESPONSE
-    console.log("Webhook received:");
+    console.log("VALID WEBHOOK RECEIVED:");
     console.log(req.body);
 });
 
