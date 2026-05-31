@@ -112,6 +112,20 @@ const POSITION_CONTROL = {
 };
 
 
+
+
+const AUTONOMOUS_POSITION_MANAGER = {
+  breakEvenTriggerPercent: 1.5,
+  profitLockTiers: [
+    { profitPercent: 2, lockPercent: 0.5 },
+    { profitPercent: 4, lockPercent: 2 },
+    { profitPercent: 6, lockPercent: 4 },
+    { profitPercent: 10, lockPercent: 7 },
+  ],
+  maxHealthyDurationMinutes: 240,
+  enabled: true,
+};
+
 const PRODUCTION_RUNTIME = {
   environment:
     process.env.NODE_ENV || "development",
@@ -966,6 +980,138 @@ function getPositionHealth(unrealizedPnl) {
   return "DEVELOPING";
 }
 
+
+function getTradePnlPercent(trade) {
+  const entryPrice = Number(trade?.entryPrice || 0);
+  const currentPrice = Number(trade?.currentPrice || trade?.entryPrice || 0);
+
+  if (!entryPrice || !currentPrice) {
+    return 0;
+  }
+
+  if (trade.side === "LONG") {
+    return ((currentPrice - entryPrice) / entryPrice) * 100;
+  }
+
+  return 0;
+}
+
+function getActiveProfitLockTier(pnlPercent) {
+  return AUTONOMOUS_POSITION_MANAGER.profitLockTiers
+    .filter((tier) => pnlPercent >= tier.profitPercent)
+    .sort((a, b) => b.profitPercent - a.profitPercent)[0] || null;
+}
+
+function getRegimeAlignmentForTrade(trade) {
+  const regime = String(trade?.regime || "NEUTRAL").toUpperCase();
+  const side = String(trade?.side || "LONG").toUpperCase();
+
+  if (regime === "NEUTRAL") return "NEUTRAL";
+  if (side === "LONG" && regime === "BULL") return "ALIGNED";
+  if (side === "LONG" && regime === "BEAR") return "DEFENSIVE";
+
+  return "MIXED";
+}
+
+function getVolatilityAlignmentForTrade(trade) {
+  const volatility = String(trade?.volatility || "NORMAL").toUpperCase();
+
+  if (volatility === "LOW") return "STABLE";
+  if (volatility === "NORMAL") return "FAVORABLE";
+  if (volatility === "HIGH") return "CAUTION";
+  if (volatility === "EXPLOSIVE") return "DEFENSIVE";
+
+  return "NORMAL";
+}
+
+function calculatePositionHealthScore(trade) {
+  if (!trade) return 0;
+
+  const pnlPercent = getTradePnlPercent(trade);
+  const durationMinutes = calculateTradeDurationSeconds(trade) / 60;
+  const regimeAlignment = getRegimeAlignmentForTrade(trade);
+  const volatilityAlignment = getVolatilityAlignmentForTrade(trade);
+
+  let score = 58;
+
+  score += Math.max(-22, Math.min(26, pnlPercent * 4));
+  if (trade.breakEvenActive) score += 8;
+  if (trade.trailingActive) score += 10;
+  if (Number(trade.protectedProfit || 0) > 0) score += 6;
+
+  if (regimeAlignment === "ALIGNED") score += 10;
+  if (regimeAlignment === "DEFENSIVE") score -= 12;
+
+  if (["STABLE", "FAVORABLE"].includes(volatilityAlignment)) score += 4;
+  if (volatilityAlignment === "CAUTION") score -= 4;
+  if (volatilityAlignment === "DEFENSIVE") score -= 10;
+
+  if (durationMinutes > AUTONOMOUS_POSITION_MANAGER.maxHealthyDurationMinutes) {
+    score -= Math.min(12, Math.floor((durationMinutes - AUTONOMOUS_POSITION_MANAGER.maxHealthyDurationMinutes) / 60) * 2);
+  }
+
+  if (trade.reversalRisk === "HIGH") score -= 12;
+  if (trade.marketPressure === "EXTREME") score -= 8;
+
+  return Math.max(0, Math.min(100, Math.round(score)));
+}
+
+function getPositionRiskStateFromScore(score) {
+  if (score >= 82) return "LOW";
+  if (score >= 60) return "CONTROLLED";
+  if (score >= 40) return "ELEVATED";
+  return "HIGH";
+}
+
+function applyAutonomousPositionManager(trade) {
+  if (!AUTONOMOUS_POSITION_MANAGER.enabled || !trade || trade.side !== "LONG") {
+    return trade;
+  }
+
+  const entryPrice = Number(trade.entryPrice || 0);
+  const pnlPercent = getTradePnlPercent(trade);
+  const activeTier = getActiveProfitLockTier(pnlPercent);
+
+  if (pnlPercent >= AUTONOMOUS_POSITION_MANAGER.breakEvenTriggerPercent && !trade.breakEvenActive) {
+    trade.stopLossPrice = entryPrice;
+    trade.breakEvenActive = true;
+    trade.protectionLevel = "BREAK_EVEN";
+    trade.lifecycle = "PROTECTED";
+    trade.status = "PROTECTED";
+  }
+
+  if (activeTier && entryPrice > 0) {
+    const lockedStop = Number((entryPrice * (1 + activeTier.lockPercent / 100)).toFixed(2));
+
+    if (!trade.stopLossPrice || lockedStop > Number(trade.stopLossPrice)) {
+      trade.stopLossPrice = lockedStop;
+      trade.trailingStopPrice = lockedStop;
+      trade.trailingActive = true;
+      trade.profitLockTier = `${activeTier.profitPercent}% → ${activeTier.lockPercent}%`;
+      trade.protectionLevel = "PROFIT_LOCK";
+      trade.lifecycle = "TRAILING";
+      trade.status = "TRAILING";
+      trade.protectedProfit = Number(((lockedStop - entryPrice) * Number(trade.quantity || 1)).toFixed(2));
+    }
+  }
+
+  trade.pnlPercent = Number(pnlPercent.toFixed(2));
+  trade.regimeAlignment = getRegimeAlignmentForTrade(trade);
+  trade.volatilityAlignment = getVolatilityAlignmentForTrade(trade);
+  trade.healthScore = calculatePositionHealthScore(trade);
+  trade.riskState = getPositionRiskStateFromScore(trade.healthScore);
+  trade.managerAction =
+    trade.riskState === "LOW"
+      ? "HOLD / TRAIL"
+      : trade.riskState === "CONTROLLED"
+        ? "MANAGE OPEN POSITION"
+        : trade.riskState === "ELEVATED"
+          ? "WATCH REVERSAL"
+          : "DEFENSIVE REVIEW";
+
+  return trade;
+}
+
 function getTradeTelemetry(trade) {
   const enriched = enrichActiveTrade(trade);
 
@@ -1044,6 +1190,13 @@ function enrichActiveTrade(trade) {
     lifecycle: trade.lifecycle || trade.status || "OPEN",
     status: trade.status || "OPEN",
     health: getPositionHealth(unrealizedPnl),
+    healthScore: trade.healthScore ?? calculatePositionHealthScore(trade),
+    pnlPercent: trade.pnlPercent ?? Number(getTradePnlPercent(trade).toFixed(2)),
+    regimeAlignment: trade.regimeAlignment || getRegimeAlignmentForTrade(trade),
+    volatilityAlignment: trade.volatilityAlignment || getVolatilityAlignmentForTrade(trade),
+    riskState: trade.riskState || getPositionRiskStateFromScore(trade.healthScore ?? calculatePositionHealthScore(trade)),
+    managerAction: trade.managerAction || "MONITOR",
+    profitLockTier: trade.profitLockTier || "NONE",
   };
 }
 
@@ -1240,6 +1393,7 @@ function updateTradeLifecycle(trade, marketPrice) {
   trade.durationSeconds = calculateTradeDurationSeconds(trade);
 
   updateTrailingStop(trade);
+  applyAutonomousPositionManager(trade);
 
   if (trade.side === "LONG" && trade.stopLossPrice && price <= trade.stopLossPrice) {
     trade.lifecycle = "STOPPED";
@@ -2169,6 +2323,7 @@ function getPositionManagement() {
         "Default take-profit is shown for planning. Auto TAKE_PROFIT only triggers when takeProfit is explicitly supplied on the BUY signal.",
       trailingEngine:
         "Autonomous trailing stop + break-even protection active.",
+      autonomousManager: AUTONOMOUS_POSITION_MANAGER,
     },
   };
 }
