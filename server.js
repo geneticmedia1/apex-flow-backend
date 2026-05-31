@@ -39,7 +39,7 @@ const {
   getRuntimeControlStatus,
 } = require("./tradeEngine");
 
-const { saveSignal, loadSignals } = require("./database");
+const { saveSignal, loadSignals, saveRuntimeEvent, loadRuntimeEvents } = require("./database");
 
 const app = express();
 const server = http.createServer(app);
@@ -56,6 +56,7 @@ app.use(express.json());
 
 let latestSignal = null;
 let signalHistory = [];
+let runtimeEventHistory = [];
 
 async function restoreDatabaseState() {
   console.log("Loading previous database state...");
@@ -69,11 +70,100 @@ async function restoreDatabaseState() {
 
     console.log(`Signals restored: ${signalHistory.length}`);
 
+    runtimeEventHistory = await loadRuntimeEvents();
+    console.log(`Runtime events restored: ${runtimeEventHistory.length}`);
+
     await restoreTradeHistory();
 
     console.log("Backend recovery complete.");
   } catch (err) {
     console.error("Database recovery failed:", err.message);
+  }
+}
+
+
+function createRuntimeEvent(category, severity, message, payload = {}) {
+  const event = {
+    time: new Date().toISOString(),
+    category: String(category || "SYSTEM").toUpperCase(),
+    severity: String(severity || "INFO").toUpperCase(),
+    message,
+    symbol: payload.symbol || payload.signal?.symbol || null,
+    action: payload.action || payload.signal?.action || null,
+    setup: payload.setup || payload.signal?.setup || null,
+    payload,
+  };
+
+  runtimeEventHistory.unshift(event);
+
+  if (runtimeEventHistory.length > 150) {
+    runtimeEventHistory.pop();
+  }
+
+  try {
+    saveRuntimeEvent(event);
+  } catch (err) {
+    console.error("Runtime event save failed:", err.message);
+  }
+
+  io.emit("runtime-event", event);
+
+  return event;
+}
+
+function emitLifecycleEvents(signal, processResult) {
+  if (!signal) return;
+
+  createRuntimeEvent(
+    "SIGNAL",
+    signal.action === "SELL" ? "WARNING" : "SUCCESS",
+    `${signal.symbol} ${signal.action} ${signal.setup || "signal"} received`,
+    { signal }
+  );
+
+  if (!processResult) return;
+
+  if (!processResult.accepted) {
+    createRuntimeEvent(
+      "RISK",
+      "WARNING",
+      `${signal.symbol} ${signal.action} rejected: ${processResult.reason || "Risk check failed"}`,
+      { signal, result: processResult }
+    );
+    return;
+  }
+
+  if (processResult.action === "OPENED") {
+    createRuntimeEvent(
+      "EXECUTION",
+      "SUCCESS",
+      `${signal.symbol} paper ${processResult.trade?.side || "LONG"} opened at ${processResult.trade?.entryPrice || signal.price}`,
+      { signal, result: processResult }
+    );
+
+    createRuntimeEvent(
+      "LIFECYCLE",
+      "SUCCESS",
+      `${signal.symbol} lifecycle moved SIGNAL → OPEN`,
+      { signal, result: processResult }
+    );
+  }
+
+  if (processResult.action === "CLOSED") {
+    const pnl = Number(processResult.trade?.pnl || 0);
+    createRuntimeEvent(
+      "EXECUTION",
+      pnl >= 0 ? "SUCCESS" : "WARNING",
+      `${signal.symbol} position closed · PnL ${pnl.toFixed(2)}`,
+      { signal, result: processResult }
+    );
+
+    createRuntimeEvent(
+      "LIFECYCLE",
+      pnl >= 0 ? "SUCCESS" : "WARNING",
+      `${signal.symbol} lifecycle moved OPEN → CLOSED`,
+      { signal, result: processResult }
+    );
   }
 }
 
@@ -97,6 +187,7 @@ function emitDashboardUpdates(signal = null, processResult = null) {
   io.emit("portfolio-update", getPortfolioSummary());
   io.emit("analytics-update", getAnalytics());
   io.emit("risk-update", getRiskStatus());
+  io.emit("runtime-events-update", runtimeEventHistory);
 }
 
 app.post("/webhook", (req, res) => {
@@ -141,6 +232,7 @@ app.post("/webhook", (req, res) => {
 
   const processResult = processSignal(signal);
 
+  emitLifecycleEvents(signal, processResult);
   emitDashboardUpdates(signal, processResult);
 
   res.status(processResult.accepted ? 200 : 400).json({
@@ -168,6 +260,10 @@ app.get("/status", (req, res) => {
 
 app.get("/signals", (req, res) => {
   res.json(signalHistory);
+});
+
+app.get("/runtime-events", (req, res) => {
+  res.json(runtimeEventHistory);
 });
 
 app.get("/account", (req, res) => {
@@ -347,4 +443,5 @@ setInterval(() => {
   io.emit("position-telemetry-update", getPositionTelemetry());
   io.emit("portfolio-update", getPortfolioSummary());
   io.emit("risk-update", getRiskStatus());
+  io.emit("runtime-events-update", runtimeEventHistory);
 }, 5000);

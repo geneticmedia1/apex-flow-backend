@@ -29,6 +29,18 @@ CREATE TABLE IF NOT EXISTS trades (
   exitTime TEXT,
   status TEXT
 );
+
+CREATE TABLE IF NOT EXISTS runtime_events (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  time TEXT,
+  category TEXT,
+  severity TEXT,
+  message TEXT,
+  symbol TEXT,
+  action TEXT,
+  setup TEXT,
+  payload TEXT
+);
 `);
 
 function saveSignal(signal) {
@@ -82,10 +94,42 @@ function loadTrades() {
   return stmt.all();
 }
 
+function saveRuntimeEvent(event) {
+  const stmt = db.prepare(`
+    INSERT INTO runtime_events
+    (time, category, severity, message, symbol, action, setup, payload)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+  `);
+
+  stmt.run(
+    event.time || new Date().toISOString(),
+    event.category || "SYSTEM",
+    event.severity || "INFO",
+    event.message || "Runtime event",
+    event.symbol || null,
+    event.action || null,
+    event.setup || null,
+    JSON.stringify(event.payload || {})
+  );
+}
+
+function loadRuntimeEvents() {
+  const stmt = db.prepare(
+    `SELECT * FROM runtime_events ORDER BY id DESC LIMIT 150`
+  );
+
+  return stmt.all().map((event) => ({
+    ...event,
+    payload: event.payload ? JSON.parse(event.payload) : {},
+  }));
+}
+
 module.exports = {
   db,
   saveSignal,
   saveTrade,
   loadSignals,
   loadTrades,
+  saveRuntimeEvent,
+  loadRuntimeEvents,
 };
