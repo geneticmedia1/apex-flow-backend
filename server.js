@@ -39,7 +39,7 @@ const {
   getRuntimeControlStatus,
 } = require("./tradeEngine");
 
-const { saveSignal, loadSignals, saveRuntimeEvent, loadRuntimeEvents } = require("./database");
+const { saveSignal, loadSignals, saveRuntimeEvent, loadRuntimeEvents, clearDatabase } = require("./database");
 
 const app = express();
 const server = http.createServer(app);
@@ -200,22 +200,37 @@ app.post("/webhook", (req, res) => {
 
   const signal = {
     time: new Date().toISOString(),
-    symbol: req.body.symbol || "BTCUSD",
-    action: req.body.action || "UNKNOWN",
+    symbol: req.body.symbol || req.body.ticker || "BTCUSD",
+    action: String(req.body.action || "UNKNOWN").toUpperCase(),
     setup: req.body.setup || "NONE",
     price: Number(req.body.price || 0),
     quantity:
       req.body.quantity !== undefined
         ? Number(req.body.quantity)
-        : undefined,
+        : req.body.qty !== undefined
+          ? Number(req.body.qty)
+          : undefined,
     stopLoss:
       req.body.stopLoss !== undefined
         ? Number(req.body.stopLoss)
-        : undefined,
+        : req.body.stop !== undefined
+          ? Number(req.body.stop)
+          : undefined,
     takeProfit:
       req.body.takeProfit !== undefined
         ? Number(req.body.takeProfit)
+        : req.body.target !== undefined
+          ? Number(req.body.target)
+          : undefined,
+    trail:
+      req.body.trail !== undefined
+        ? Number(req.body.trail)
         : undefined,
+    equityPct:
+      req.body.equity_pct !== undefined
+        ? Number(req.body.equity_pct)
+        : undefined,
+    exitMode: req.body.exit_mode || null,
     regime: req.body.regime || "NEUTRAL",
     volatility: req.body.volatility || "NORMAL",
   };
@@ -235,8 +250,7 @@ app.post("/webhook", (req, res) => {
   emitLifecycleEvents(signal, processResult);
   emitDashboardUpdates(signal, processResult);
 
-  res.status(processResult.accepted ? 200 : 400).json({
-    ok: processResult.accepted,
+    res.status(200).json({    ok: processResult.accepted,
     result: processResult,
     signal,
     account: getAccount(),
@@ -427,6 +441,23 @@ app.post("/runtime/recovery/reset", (req, res) => {
   );
 });
 
+app.post("/admin/reset-paper", (req, res) => {
+  signalHistory = [];
+  latestSignal = null;
+
+  resetPaperState();
+
+  if (typeof clearDatabase === "function") {
+    clearDatabase();
+  }
+
+  emitDashboardUpdates();
+
+  res.json({
+    ok: true,
+    message: "Paper state reset",
+  });
+});
 
 const PORT = process.env.PORT || 3000;
 

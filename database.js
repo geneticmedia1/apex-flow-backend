@@ -124,6 +124,12 @@ function loadRuntimeEvents() {
   }));
 }
 
+function clearDatabase() {
+  db.prepare("DELETE FROM signals").run();
+  db.prepare("DELETE FROM trades").run();
+  db.prepare("DELETE FROM runtime_events").run();
+}
+
 module.exports = {
   db,
   saveSignal,
@@ -132,4 +138,5 @@ module.exports = {
   loadTrades,
   saveRuntimeEvent,
   loadRuntimeEvents,
+  clearDatabase,
 };

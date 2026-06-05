@@ -915,16 +915,28 @@ const exposureProfile =
   return Number(Math.max(quantity, 0.0001).toFixed(6));
 }
 
-function buildTradeControls(signal, price) {
+function buildTradeControls(signal, price, side = "LONG") {
+  const direction = String(side || "LONG").toUpperCase();
+
+  const defaultStopLossPrice =
+    direction === "SHORT"
+      ? price * (1 + POSITION_CONTROL.defaultStopLossPercent / 100)
+      : price * (1 - POSITION_CONTROL.defaultStopLossPercent / 100);
+
+  const defaultTakeProfitPrice =
+    direction === "SHORT"
+      ? price * (1 - POSITION_CONTROL.defaultTakeProfitPercent / 100)
+      : price * (1 + POSITION_CONTROL.defaultTakeProfitPercent / 100);
+
   const stopLossPrice =
     signal.stopLoss !== undefined && Number(signal.stopLoss) > 0
       ? Number(signal.stopLoss)
-      : price * (1 - POSITION_CONTROL.defaultStopLossPercent / 100);
+      : defaultStopLossPrice;
 
   const takeProfitPrice =
     signal.takeProfit !== undefined && Number(signal.takeProfit) > 0
       ? Number(signal.takeProfit)
-      : price * (1 + POSITION_CONTROL.defaultTakeProfitPercent / 100);
+      : defaultTakeProfitPrice;
 
   const quantity =
     signal.quantity !== undefined && Number(signal.quantity) > 0
@@ -950,12 +962,14 @@ function calculateUnrealizedPnl(trade) {
     trade.entryPrice;
 
   const quantity = Number(trade.quantity || 1);
+  const entryPrice = Number(trade.entryPrice || 0);
+  const price = Number(currentPrice || entryPrice);
 
-  if (trade.side === "LONG") {
-    return (Number(currentPrice) - Number(trade.entryPrice)) * quantity;
+  if (trade.side === "SHORT") {
+    return (entryPrice - price) * quantity;
   }
 
-  return 0;
+  return (price - entryPrice) * quantity;
 }
 
 function getTotalUnrealizedPnlRaw() {
@@ -989,11 +1003,11 @@ function getTradePnlPercent(trade) {
     return 0;
   }
 
-  if (trade.side === "LONG") {
-    return ((currentPrice - entryPrice) / entryPrice) * 100;
+  if (trade.side === "SHORT") {
+    return ((entryPrice - currentPrice) / entryPrice) * 100;
   }
 
-  return 0;
+  return ((currentPrice - entryPrice) / entryPrice) * 100;
 }
 
 function getActiveProfitLockTier(pnlPercent) {
@@ -1218,7 +1232,11 @@ function closeTradeBySymbol(symbol, exitPrice, closeReason = "CLOSED") {
 
   const price = Number(exitPrice || trade.currentPrice || trade.entryPrice);
   const quantity = Number(trade.quantity || 1);
-  const pnl = (price - Number(trade.entryPrice || 0)) * quantity;
+  const entryPrice = Number(trade.entryPrice || 0);
+  const pnl =
+    trade.side === "SHORT"
+      ? (entryPrice - price) * quantity
+      : (price - entryPrice) * quantity;
 
   account.balance += pnl;
   account.equity = account.balance;
@@ -1395,17 +1413,21 @@ function updateTradeLifecycle(trade, marketPrice) {
   updateTrailingStop(trade);
   applyAutonomousPositionManager(trade);
 
-  if (trade.side === "LONG" && trade.stopLossPrice && price <= trade.stopLossPrice) {
+  if (
+    trade.stopLossPrice &&
+    ((trade.side === "LONG" && price <= trade.stopLossPrice) ||
+      (trade.side === "SHORT" && price >= trade.stopLossPrice))
+  ) {
     trade.lifecycle = "STOPPED";
     trade.status = "STOPPED";
     return closeTradeBySymbol(trade.symbol, price, "STOPPED");
   }
 
   if (
-    trade.side === "LONG" &&
     trade.takeProfitPrice &&
     trade.hardTakeProfitEnabled &&
-    price >= trade.takeProfitPrice
+    ((trade.side === "LONG" && price >= trade.takeProfitPrice) ||
+      (trade.side === "SHORT" && price <= trade.takeProfitPrice))
   ) {
     trade.lifecycle = "TAKE_PROFIT";
     trade.status = "TAKE_PROFIT";
@@ -1728,8 +1750,10 @@ function validateRisk(signal) {
   const action = normalizeAction(signal.action);
   const symbol = normalizeSymbol(signal.symbol);
   const price = Number(signal.price || 0);
+  const openActions = ["BUY", "SELL"];
+  const closeActions = ["CLOSE", "EXIT", "CLOSE_LONG", "CLOSE_SHORT"];
 
-  const signalKey = `${symbol}-${action}-${price}`;
+  const signalKey = `${symbol}-${action}-${price}-${signal.setup || "NONE"}`;
 
   if (!price || Number.isNaN(price)) {
     return rejectSignal(signal, "Invalid or missing price");
@@ -1747,7 +1771,7 @@ function validateRisk(signal) {
     return rejectSignal(signal, "Duplicate signal blocked");
   }
 
-  if (action === "BUY") {
+  if (openActions.includes(action)) {
     if (activeTrades[symbol]) {
       return rejectSignal(signal, "Active trade already open for this symbol");
     }
@@ -1784,11 +1808,11 @@ function validateRisk(signal) {
     }
   }
 
-  if (action === "SELL" && !activeTrades[symbol]) {
+  if (closeActions.includes(action) && !activeTrades[symbol]) {
     return rejectSignal(signal, "No active trade to close for this symbol");
   }
 
-  if (action !== "BUY" && action !== "SELL" && action !== "PRICE") {
+  if (![...openActions, ...closeActions, "PRICE"].includes(action)) {
     return rejectSignal(signal, "Unsupported action");
   }
 
@@ -1801,6 +1825,9 @@ function processSignal(signal) {
   const action = normalizeAction(signal.action);
   const symbol = normalizeSymbol(signal.symbol);
   const price = Number(signal.price || 0);
+  const isOpenLong = action === "BUY";
+  const isOpenShort = action === "SELL";
+  const isCloseAction = ["CLOSE", "EXIT", "CLOSE_LONG", "CLOSE_SHORT"].includes(action);
 
   updateLatestPrice(symbol, price);
 
@@ -1859,14 +1886,15 @@ function processSignal(signal) {
     return riskCheck;
   }
 
-  if (action === "BUY" && !activeTrades[symbol]) {
-    const controls = buildTradeControls(signal, price);
+  if ((isOpenLong || isOpenShort) && !activeTrades[symbol]) {
+    const side = isOpenShort ? "SHORT" : "LONG";
+    const controls = buildTradeControls(signal, price, side);
 
     const newTrade = {
       entryTime: signal.time,
       openTime: Date.now(),
       symbol,
-      side: "LONG",
+      side,
       quantity: controls.quantity,
       entryPrice: price,
       currentPrice: price,
@@ -1901,21 +1929,21 @@ function processSignal(signal) {
 
     activeTrades[symbol] = newTrade;
 
-    console.log("PAPER TRADE OPENED:", newTrade);
+    console.log(`PAPER ${side} TRADE OPENED:`, newTrade);
 
     if (EXECUTION_MODE === "LIVE") {
       executeLiveOrder({
         symbol,
-        side: "LONG",
-        action: "BUY",
+        side,
+        action,
         price,
         quantity: controls.quantity,
       });
     } else {
       broker.placeOrder({
         symbol,
-        side: "LONG",
-        action: "BUY",
+        side,
+        action,
         price,
         time: signal.time,
         quantity: controls.quantity,
@@ -1930,8 +1958,9 @@ function processSignal(signal) {
     };
   }
 
-  if (action === "SELL" && activeTrades[symbol]) {
-    const closedTrade = closeTradeBySymbol(symbol, price, "CLOSED");
+  if (isCloseAction && activeTrades[symbol]) {
+    const closeReason = signal.setup || action || "CLOSED";
+    const closedTrade = closeTradeBySymbol(symbol, price, closeReason);
 
     return {
       accepted: true,
@@ -3776,11 +3805,32 @@ function getRuntimeControlStatus() {
   };
 }
 
+function resetPaperState() {
+  account = {
+    balance: STARTING_BALANCE,
+    equity: STARTING_BALANCE,
+    wins: 0,
+    losses: 0,
+    totalTrades: 0,
+  };
+
+  activeTrades = {};
+  tradeHistory = [];
+  rejectedSignals = [];
+  lastSignalKey = null;
+  latestPrices = {};
+
+  return {
+    ok: true,
+    message: "Paper engine state reset",
+  };
+}
 
 module.exports = {
   getRuntimeControlStatus,
   resetRuntimeRecoverySystems,
   restartRuntimeSystems,
+  resetPaperState,
   activateEmergencyHalt,
   disarmExecutionEngine,
   armExecutionEngine,
