@@ -34,6 +34,7 @@ const {
   armExecutionEngine,
   disarmExecutionEngine,
   activateEmergencyHalt,
+  resetPaperState,
   restartRuntimeSystems,
   resetRuntimeRecoverySystems,
   getRuntimeControlStatus,
