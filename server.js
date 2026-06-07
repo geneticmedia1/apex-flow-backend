@@ -78,12 +78,53 @@ const BINANCE_SYMBOL_MAP = {
   SOLUSDT: "SOLUSDT",
 };
 
+const COINBASE_PRODUCT_MAP = {
+  BTCUSD: "BTC-USD",
+  BTCUSDT: "BTC-USD",
+  ETHUSD: "ETH-USD",
+  ETHUSDT: "ETH-USD",
+  SOLUSD: "SOL-USD",
+  SOLUSDT: "SOL-USD",
+};
+
 let livePriceSyncRunning = false;
 let lastLivePriceSyncAt = null;
+let lastLivePriceSyncError = null;
+let lastLivePriceSyncPrices = {};
+
+function normalizeMarketSymbol(symbol) {
+  return String(symbol || "").toUpperCase().replace(/[^A-Z0-9]/g, "");
+}
 
 function toBinanceTicker(symbol) {
-  const normalized = String(symbol || "").toUpperCase().replace(/[^A-Z0-9]/g, "");
+  const normalized = normalizeMarketSymbol(symbol);
   return BINANCE_SYMBOL_MAP[normalized] || normalized.replace(/USD$/, "USDT");
+}
+
+function toCoinbaseProduct(symbol) {
+  const normalized = normalizeMarketSymbol(symbol);
+  return COINBASE_PRODUCT_MAP[normalized] || normalized.replace(/USD$/, "-USD");
+}
+
+async function fetchCoinbaseTickerPrice(symbol) {
+  const product = toCoinbaseProduct(symbol);
+  const response = await fetch(
+    `https://api.exchange.coinbase.com/products/${product}/ticker`,
+    { headers: { "User-Agent": "ApexFlowCommandCenter/11.2.3" } }
+  );
+
+  if (!response.ok) {
+    throw new Error(`Coinbase ticker failed for ${symbol}/${product}: ${response.status}`);
+  }
+
+  const data = await response.json();
+  const price = Number(data.price);
+
+  if (!price || Number.isNaN(price)) {
+    throw new Error(`Invalid Coinbase price for ${symbol}/${product}`);
+  }
+
+  return price;
 }
 
 async function fetchBinanceTickerPrice(symbol) {
@@ -106,6 +147,15 @@ async function fetchBinanceTickerPrice(symbol) {
   return price;
 }
 
+async function fetchLiveTickerPrice(symbol) {
+  try {
+    return { price: await fetchCoinbaseTickerPrice(symbol), source: "COINBASE" };
+  } catch (coinbaseError) {
+    const binanceResult = await fetchBinanceTickerPrice(symbol);
+    return { price: binanceResult, source: "BINANCE", fallbackReason: coinbaseError.message };
+  }
+}
+
 async function syncLivePricesForActiveTrades() {
   if (livePriceSyncRunning) return;
 
@@ -121,15 +171,28 @@ async function syncLivePricesForActiveTrades() {
   livePriceSyncRunning = true;
 
   try {
-    await Promise.all(symbols.map(async (symbol) => {
-      const price = await fetchBinanceTickerPrice(symbol);
-      updateLatestPrice(symbol, price);
+    const updates = await Promise.all(symbols.map(async (symbol) => {
+      const result = await fetchLiveTickerPrice(symbol);
+      updateLatestPrice(symbol, result.price);
+      return { symbol, ...result };
     }));
 
     updateAllTradeLifecycles();
     lastLivePriceSyncAt = new Date().toISOString();
+    lastLivePriceSyncError = null;
+    lastLivePriceSyncPrices = Object.fromEntries(
+      updates.map((update) => [update.symbol, {
+        price: update.price,
+        source: update.source,
+        fallbackReason: update.fallbackReason || null,
+        updatedAt: lastLivePriceSyncAt,
+      }])
+    );
+
+    console.log("[APEX PRICE SYNC]", lastLivePriceSyncPrices);
   } catch (error) {
-    console.error("Live price sync failed:", error.message);
+    lastLivePriceSyncError = error.message;
+    console.error("[APEX PRICE SYNC FAILED]", error.message);
   } finally {
     livePriceSyncRunning = false;
   }
@@ -489,6 +552,16 @@ app.get("/active-trade", (req, res) => {
 
 app.get("/active-trades", (req, res) => {
   res.json(getActiveTradeListForDashboard());
+});
+
+app.get("/price-sync-status", (req, res) => {
+  res.json({
+    running: livePriceSyncRunning,
+    lastSyncAt: lastLivePriceSyncAt,
+    lastError: lastLivePriceSyncError,
+    lastPrices: lastLivePriceSyncPrices,
+    activeTrades: getActiveTradeListForDashboard(),
+  });
 });
 
 app.get("/active-trades-map", (req, res) => {
