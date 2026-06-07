@@ -1,4 +1,4 @@
-const BrokerInterface = require("./brokerinterface");
+const BrokerInterface = require("./brokerInterface");
 
 class BinanceBroker extends BrokerInterface {
   constructor() {

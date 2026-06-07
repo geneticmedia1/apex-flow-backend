@@ -189,6 +189,55 @@ let tradeHistory = [];
 let rejectedSignals = [];
 let lastSignalKey = null;
 let latestPrices = {};
+let equityHistory = [
+  {
+    trade: 0,
+    time: new Date().toISOString(),
+    equity: STARTING_BALANCE,
+    pnl: 0,
+    symbol: "START",
+  },
+];
+
+function recordEquityPoint(symbol = "LIVE") {
+  const liveEquity = getLiveEquity();
+  const lastPoint = equityHistory[0];
+
+  if (lastPoint && Math.abs(Number(lastPoint.equity || 0) - liveEquity) < 0.01) {
+    return;
+  }
+
+  equityHistory.unshift({
+    trade: equityHistory.length,
+    time: new Date().toISOString(),
+    equity: liveEquity,
+    pnl: Number((liveEquity - STARTING_BALANCE).toFixed(2)),
+    symbol,
+  });
+
+  if (equityHistory.length > 250) {
+    equityHistory.pop();
+  }
+}
+
+function getEquityCurve() {
+  const livePoint = {
+    trade: equityHistory.length,
+    time: new Date().toISOString(),
+    equity: getLiveEquity(),
+    pnl: Number((getLiveEquity() - STARTING_BALANCE).toFixed(2)),
+    symbol: "LIVE",
+  };
+
+  const curve = [livePoint, ...equityHistory]
+    .filter((point, index, arr) => index === 0 || point.equity !== arr[index - 1].equity)
+    .reverse();
+
+  return curve.length > 1 ? curve : [
+    { trade: 0, time: new Date().toISOString(), equity: STARTING_BALANCE, pnl: 0, symbol: "START" },
+    livePoint,
+  ];
+}
 
 
 /* ================================
@@ -880,25 +929,43 @@ function calculateTradeDurationSeconds(trade) {
   return Math.max(0, Math.floor((now - entryTime) / 1000));
 }
 
-function calculatePositionSize(entryPrice, stopLossPrice) {
+function getSignalAllocationPercent(signal = {}) {
+  const explicit = Number(signal.equityPct ?? signal.equity_pct);
+
+  if (Number.isFinite(explicit) && explicit > 0) {
+    return Math.min(100, Math.max(0, explicit));
+  }
+
+  return Math.min(100, Math.max(0, POSITION_CONTROL.maxExposurePercent || 50));
+}
+
+function capQuantityToAccountExposure(quantity, entryPrice, signal = {}) {
+  const price = Number(entryPrice || 0);
+  const rawQuantity = Number(quantity || 0);
+
+  if (!price || !Number.isFinite(price) || !rawQuantity || !Number.isFinite(rawQuantity)) {
+    return 0;
+  }
+
+  const allocationPercent = getSignalAllocationPercent(signal);
+  const maxAllocation = Number(account.equity || account.balance || STARTING_BALANCE) * (allocationPercent / 100);
+  const maxQuantity = maxAllocation > 0 ? maxAllocation / price : 0;
+
+  return Number(Math.max(Math.min(rawQuantity, maxQuantity), 0.000001).toFixed(6));
+}
+
+function calculatePositionSize(entryPrice, stopLossPrice, signal = {}) {
   const price = Number(entryPrice || 0);
   const stop = Number(stopLossPrice || 0);
 
-  if (!price || !stop || price <= stop) {
-    return 1;
+  if (!price || !Number.isFinite(price)) {
+    return 0.000001;
   }
 
-const exposureProfile =
-    getExposureProfile();
-
-  const correlationProfile =
-    getCorrelationProfile();
-
-  const regimeProfile =
-    getPortfolioRegimeProfile();
-
-  const defenseProfile =
-    getPortfolioDefenseProfile();
+  const exposureProfile = getExposureProfile();
+  const correlationProfile = getCorrelationProfile();
+  const regimeProfile = getPortfolioRegimeProfile();
+  const defenseProfile = getPortfolioDefenseProfile();
 
   const adjustedRiskPercent =
     POSITION_CONTROL.riskPerTradePercent *
@@ -907,12 +974,14 @@ const exposureProfile =
     regimeProfile.aggressionMultiplier *
     defenseProfile.defenseMultiplier;
 
-  const riskAmount =
-    account.equity * (adjustedRiskPercent / 100);
-  const riskPerUnit = price - stop;
-  const quantity = riskAmount / riskPerUnit;
+  const riskAmount = account.equity * (adjustedRiskPercent / 100);
+  const riskPerUnit = Math.abs(price - stop);
 
-  return Number(Math.max(quantity, 0.0001).toFixed(6));
+  const riskBasedQuantity = riskPerUnit > 0
+    ? riskAmount / riskPerUnit
+    : Number(account.equity || STARTING_BALANCE) / price;
+
+  return capQuantityToAccountExposure(riskBasedQuantity, price, signal);
 }
 
 function buildTradeControls(signal, price, side = "LONG") {
@@ -938,10 +1007,12 @@ function buildTradeControls(signal, price, side = "LONG") {
       ? Number(signal.takeProfit)
       : defaultTakeProfitPrice;
 
-  const quantity =
+  const requestedQuantity =
     signal.quantity !== undefined && Number(signal.quantity) > 0
       ? Number(signal.quantity)
-      : calculatePositionSize(price, stopLossPrice);
+      : calculatePositionSize(price, stopLossPrice, signal);
+
+  const quantity = capQuantityToAccountExposure(requestedQuantity, price, signal);
 
   return {
     quantity: Number(quantity.toFixed(6)),
@@ -979,8 +1050,66 @@ function getTotalUnrealizedPnlRaw() {
   );
 }
 
+
+function sanitizeActiveTrades(reason = "AUTO_SANITY_CHECK") {
+  const entries = Object.entries(activeTrades || {});
+  if (entries.length === 0) return false;
+
+  const liveBalance = Number(account?.balance || STARTING_BALANCE);
+  const maxAllowedNotional = Math.max(STARTING_BALANCE, liveBalance) * 2;
+  let removed = false;
+
+  for (const [symbol, trade] of entries) {
+    const qty = Number(trade?.quantity || 0);
+    const entry = Number(trade?.entryPrice || trade?.price || 0);
+    const notional = Math.abs(qty * entry);
+
+    if (!Number.isFinite(qty) || !Number.isFinite(entry) || qty <= 0 || entry <= 0 || notional > maxAllowedNotional) {
+      console.warn(`[APEX RESET GUARD] Removed impossible paper trade ${symbol}. Qty=${qty}, Entry=${entry}, Notional=${notional}, Reason=${reason}`);
+      delete activeTrades[symbol];
+      removed = true;
+    }
+  }
+
+  if (removed) {
+    rejectedSignals = Array.isArray(rejectedSignals) ? rejectedSignals : [];
+    if (broker && typeof broker.reset === "function") {
+      broker.reset();
+    }
+    account = {
+      balance: STARTING_BALANCE,
+      equity: STARTING_BALANCE,
+      wins: 0,
+      losses: 0,
+      totalTrades: 0,
+    };
+    latestPrices = {};
+    recordEquityPoint("SANITY_RESET");
+  }
+
+  return removed;
+}
+
 function getLiveEquity() {
   return Number((account.balance + getTotalUnrealizedPnlRaw()).toFixed(2));
+}
+
+
+function clampPercent(value, max = 100) {
+  const n = Number(value || 0);
+  if (!Number.isFinite(n) || n < 0) return 0;
+  return Number(Math.min(max, n).toFixed(2));
+}
+
+function calculateRawExposurePercent(totalExposure, equity) {
+  const exposure = Number(totalExposure || 0);
+  const liveEquity = Number(equity || 0);
+  if (!liveEquity || liveEquity <= 0) return 0;
+  return Number(((exposure / liveEquity) * 100).toFixed(2));
+}
+
+function calculateDisplayExposurePercent(totalExposure, equity) {
+  return clampPercent(calculateRawExposurePercent(totalExposure, equity));
 }
 
 function getPositionHealth(unrealizedPnl) {
@@ -1168,6 +1297,7 @@ function updateLatestPrice(symbol, price) {
     if (activeTrades[normalizedSymbol]) {
       activeTrades[normalizedSymbol].currentPrice = normalizedPrice;
       activeTrades[normalizedSymbol].lastPriceUpdate = new Date().toISOString();
+      recordEquityPoint(normalizedSymbol);
     }
   }
 }
@@ -1197,10 +1327,8 @@ function enrichActiveTrade(trade) {
     entryValue: Number(entryValue.toFixed(2)),
     durationSeconds,
     durationMinutes: Number((durationSeconds / 60).toFixed(2)),
-    exposurePercent:
-      liveEquity > 0
-        ? Number(((entryValue / liveEquity) * 100).toFixed(2))
-        : 0,
+    exposurePercent: calculateDisplayExposurePercent(entryValue, liveEquity),
+    rawExposurePercent: calculateRawExposurePercent(entryValue, liveEquity),
     lifecycle: trade.lifecycle || trade.status || "OPEN",
     status: trade.status || "OPEN",
     health: getPositionHealth(unrealizedPnl),
@@ -1569,12 +1697,8 @@ function getExposureProfile() {
 
   const liveEquity = getLiveEquity();
 
-  const exposure =
-    liveEquity > 0
-      ? Number(
-          ((totalExposure / liveEquity) * 100).toFixed(2)
-        )
-      : 0;
+  const rawExposure = calculateRawExposurePercent(totalExposure, liveEquity);
+  const exposure = calculateDisplayExposurePercent(totalExposure, liveEquity);
 
   if (exposure >= 70) {
     return {
@@ -1583,6 +1707,7 @@ function getExposureProfile() {
       exposureSeverity: "EXTREME",
       adaptiveRiskMultiplier: 0.25,
       exposurePercent: exposure,
+      rawExposurePercent: rawExposure,
     };
   }
 
@@ -1593,6 +1718,7 @@ function getExposureProfile() {
       exposureSeverity: "HIGH",
       adaptiveRiskMultiplier: 0.5,
       exposurePercent: exposure,
+      rawExposurePercent: rawExposure,
     };
   }
 
@@ -1603,6 +1729,7 @@ function getExposureProfile() {
       exposureSeverity: "MEDIUM",
       adaptiveRiskMultiplier: 0.75,
       exposurePercent: exposure,
+      rawExposurePercent: rawExposure,
     };
   }
 
@@ -1951,6 +2078,8 @@ function processSignal(signal) {
       });
     }
 
+    recordEquityPoint(symbol);
+
     return {
       accepted: true,
       action: "OPENED",
@@ -1961,6 +2090,8 @@ function processSignal(signal) {
   if (isCloseAction && activeTrades[symbol]) {
     const closeReason = signal.setup || action || "CLOSED";
     const closedTrade = closeTradeBySymbol(symbol, price, closeReason);
+
+    recordEquityPoint(symbol);
 
     return {
       accepted: true,
@@ -1976,7 +2107,24 @@ async function restoreTradeHistory() {
   try {
     const trades = await loadTrades();
 
-    tradeHistory = Array.isArray(trades) ? trades : [];
+    /*
+      v11.0.4 reset hardening:
+      Only restore finalized CLOSED trades into history/account stats.
+      Older development builds could leave OPEN/phantom rows in storage;
+      those must never be revived into the live paper account after reset.
+    */
+    tradeHistory = Array.isArray(trades)
+      ? trades.filter((trade) => String(trade.status || "CLOSED").toUpperCase() === "CLOSED")
+      : [];
+
+    activeTrades = {};
+    rejectedSignals = [];
+    lastSignalKey = null;
+    latestPrices = {};
+
+    if (broker && typeof broker.reset === "function") {
+      broker.reset();
+    }
 
     account = {
       balance: STARTING_BALANCE,
@@ -2000,6 +2148,16 @@ async function restoreTradeHistory() {
       }
     });
 
+    equityHistory = [
+      {
+        trade: 0,
+        time: new Date().toISOString(),
+        equity: Number(account.balance.toFixed(2)),
+        pnl: Number((account.balance - STARTING_BALANCE).toFixed(2)),
+        symbol: "RESTORED",
+      },
+    ];
+
     console.log(`Trades restored: ${tradeHistory.length}`);
     console.log("Portfolio rebuilt.");
   } catch (err) {
@@ -2008,6 +2166,7 @@ async function restoreTradeHistory() {
 }
 
 function getAccount() {
+  sanitizeActiveTrades("GET_ACCOUNT");
   updateAllTradeLifecycles();
 
   return {
@@ -2020,6 +2179,7 @@ function getAccount() {
 }
 
 function getActiveTrade() {
+  sanitizeActiveTrades("GET_ACTIVE_TRADE");
   updateAllTradeLifecycles();
 
   const list = getActiveTradeList();
@@ -2027,6 +2187,7 @@ function getActiveTrade() {
 }
 
 function getActiveTrades() {
+  sanitizeActiveTrades("GET_ACTIVE_TRADES");
   updateAllTradeLifecycles();
 
   return Object.fromEntries(
@@ -2038,6 +2199,7 @@ function getActiveTrades() {
 }
 
 function getActiveTradeListForDashboard() {
+  sanitizeActiveTrades("GET_ACTIVE_TRADE_LIST");
   updateAllTradeLifecycles();
 
   return getActiveTradeList();
@@ -2137,7 +2299,10 @@ function getBrokerStatus() {
   };
 
   return {
-    mode: execution.mode,
+    mode: String(execution.mode || EXECUTION_MODE).toLowerCase(),
+    executionMode: execution.mode,
+    displayMode: execution.mode === "PAPER" ? "Paper Trading" : "Live Trading",
+    status: "online",
     connected: execution.brokerConnected,
     liveTradingEnabled:
       execution.liveTradingEnabled,
@@ -2198,6 +2363,7 @@ function getBrokerStatus() {
 }
 
 function getPortfolioSummary() {
+  sanitizeActiveTrades("GET_PORTFOLIO_SUMMARY");
   updateAllTradeLifecycles();
 
   const positions = getActiveTradeList();
@@ -2218,10 +2384,8 @@ function getPortfolioSummary() {
     realizedBalance: Number(account.balance.toFixed(2)),
     unrealizedPnl: getTotalUnrealizedPnl(),
     totalExposure: Number(totalExposure.toFixed(2)),
-    exposurePercent:
-      liveEquity > 0
-        ? Number(((totalExposure / liveEquity) * 100).toFixed(2))
-        : 0,
+    exposurePercent: calculateDisplayExposurePercent(totalExposure, liveEquity),
+    rawExposurePercent: calculateRawExposurePercent(totalExposure, liveEquity),
 
     portfolioHeat: exposureProfile.portfolioHeat,
     riskPressure: exposureProfile.riskPressure,
@@ -2248,10 +2412,15 @@ function getPortfolioSummary() {
 }
 
 function getAnalytics() {
-  return calculateAnalytics(tradeHistory, {
+  const analytics = calculateAnalytics(tradeHistory, {
     ...account,
     equity: getLiveEquity(),
   });
+
+  return {
+    ...analytics,
+    equityCurve: getEquityCurve(),
+  };
 }
 
 function getPositionTelemetry() {
@@ -2261,6 +2430,7 @@ function getPositionTelemetry() {
 }
 
 function getPositionManagement() {
+  sanitizeActiveTrades("GET_POSITION_MANAGEMENT");
   updateAllTradeLifecycles();
 
   const positions = getActiveTradeList();
@@ -2291,10 +2461,8 @@ function getPositionManagement() {
     liveEquity,
     totalUnrealizedPnl,
     totalExposure: Number(totalExposure.toFixed(2)),
-    exposurePercent:
-      liveEquity > 0
-        ? Number(((totalExposure / liveEquity) * 100).toFixed(2))
-        : 0,
+    exposurePercent: calculateDisplayExposurePercent(totalExposure, liveEquity),
+    rawExposurePercent: calculateRawExposurePercent(totalExposure, liveEquity),
     correlationRisk:
       correlationProfile.correlationRisk,
 
@@ -3806,6 +3974,12 @@ function getRuntimeControlStatus() {
 }
 
 function resetPaperState() {
+  activeTrades = {};
+  tradeHistory = [];
+  rejectedSignals = [];
+  lastSignalKey = null;
+  latestPrices = {};
+
   account = {
     balance: STARTING_BALANCE,
     equity: STARTING_BALANCE,
@@ -3814,15 +3988,300 @@ function resetPaperState() {
     totalTrades: 0,
   };
 
-  activeTrades = {};
-  tradeHistory = [];
-  rejectedSignals = [];
-  lastSignalKey = null;
-  latestPrices = {};
+  equityHistory = [
+    {
+      trade: 0,
+      time: new Date().toISOString(),
+      equity: STARTING_BALANCE,
+      pnl: 0,
+      symbol: "RESET",
+    },
+    {
+      trade: 1,
+      time: new Date().toISOString(),
+      equity: STARTING_BALANCE,
+      pnl: 0,
+      symbol: "RESET_CONFIRMED",
+    },
+  ];
+
+  if (broker && typeof broker.reset === "function") {
+    broker.reset();
+  }
 
   return {
     ok: true,
     message: "Paper engine state reset",
+    account: {
+      balance: STARTING_BALANCE,
+      equity: STARTING_BALANCE,
+      realizedBalance: STARTING_BALANCE,
+      unrealizedPnl: 0,
+      wins: 0,
+      losses: 0,
+      totalTrades: 0,
+      activeTradeCount: 0,
+    },
+    activeTrade: null,
+    activeTrades: [],
+    tradeHistory: [],
+    rejectedSignals: [],
+  };
+}
+
+
+
+/* =====================================================
+   APEX FLOW v11.0.0 — OPERATOR TRADE JOURNAL
+   Plain-English trade timeline and position journal layer.
+===================================================== */
+
+function formatJournalDuration(seconds = 0) {
+  const totalSeconds = Number(seconds || 0);
+  const minutes = Math.floor(totalSeconds / 60);
+  const remainingSeconds = totalSeconds % 60;
+
+  if (minutes >= 60) {
+    const hours = Math.floor(minutes / 60);
+    const mins = minutes % 60;
+    return `${hours}h ${mins}m`;
+  }
+
+  return `${minutes}m ${remainingSeconds}s`;
+}
+
+function getPlainEnglishTradeStatus(trade) {
+  const pnl = Number(trade.unrealizedPnl || 0);
+
+  if (trade.breakEvenActive && trade.trailingActive) {
+    return "Trade is protected. The stop has moved up and Apex Flow is managing the position for further upside.";
+  }
+
+  if (trade.breakEvenActive) {
+    return "Trade has reached break-even protection. The original risk has been reduced and the position is being monitored.";
+  }
+
+  if (trade.trailingActive) {
+    return "Trailing protection is active. Apex Flow is attempting to protect gains while leaving room for continuation.";
+  }
+
+  if (pnl > 0) {
+    return "Trade is currently in profit. Apex Flow is waiting for protection triggers before tightening risk.";
+  }
+
+  if (pnl < 0) {
+    return "Trade is open and currently below entry. Risk controls are monitoring the position.";
+  }
+
+  return "Trade is open and waiting for the next management trigger.";
+}
+
+function getJournalLifecycleStage(trade) {
+  if (trade.trailingActive) {
+    return {
+      stage: "TRAILING_PROTECTED",
+      label: "Trailing Stop Active",
+      plainEnglish: "The trade is protected and the stop can continue moving upward.",
+      progress: 5,
+      totalStages: 6,
+    };
+  }
+
+  if (trade.breakEvenActive) {
+    return {
+      stage: "BREAK_EVEN_PROTECTED",
+      label: "Break-Even Protected",
+      plainEnglish: "The position has reduced original risk by moving protection to break-even or better.",
+      progress: 4,
+      totalStages: 6,
+    };
+  }
+
+  if (Number(trade.unrealizedPnl || 0) > 0) {
+    return {
+      stage: "IN_PROFIT",
+      label: "In Profit",
+      plainEnglish: "The trade is profitable but has not yet reached full protection status.",
+      progress: 3,
+      totalStages: 6,
+    };
+  }
+
+  return {
+    stage: "OPEN_MANAGED",
+    label: "Position Open",
+    plainEnglish: "The trade is active and being monitored by the management engine.",
+    progress: 3,
+    totalStages: 6,
+  };
+}
+
+function buildTradeTimeline(trade) {
+  return [
+    {
+      key: "SIGNAL_RECEIVED",
+      label: "Signal Received",
+      description: "TradingView sent a valid strategy signal.",
+      completed: true,
+    },
+    {
+      key: "RISK_CHECK",
+      label: "Risk Check Passed",
+      description: "Apex Flow accepted the trade under current safety rules.",
+      completed: true,
+    },
+    {
+      key: "POSITION_OPENED",
+      label: "Position Opened",
+      description: "The paper broker opened and started tracking the position.",
+      completed: true,
+    },
+    {
+      key: "BREAK_EVEN",
+      label: "Break-Even Protected",
+      description: "The stop has moved to entry or better, reducing original trade risk.",
+      completed: Boolean(trade.breakEvenActive),
+      active: Boolean(trade.breakEvenActive && !trade.trailingActive),
+    },
+    {
+      key: "TRAILING_STOP",
+      label: "Trailing Stop Active",
+      description: "The stop is now following price to protect profit as the trade develops.",
+      completed: Boolean(trade.trailingActive),
+      active: Boolean(trade.trailingActive),
+    },
+    {
+      key: "EXIT_PENDING",
+      label: "Exit Pending",
+      description: "The position remains open until an exit, stop, or take-profit event is processed.",
+      completed: false,
+      active: true,
+    },
+  ];
+}
+
+function buildDecisionLog(trade) {
+  const log = [];
+
+  log.push({
+    time: trade.entryTime || new Date().toISOString(),
+    title: "Position opened",
+    message: `${trade.symbol} ${trade.side || "LONG"} opened at ${trade.entryPrice}.`,
+    severity: "SUCCESS",
+  });
+
+  if (Number(trade.unrealizedPnl || 0) > 0) {
+    log.push({
+      time: trade.lastPriceUpdate || new Date().toISOString(),
+      title: "Position in profit",
+      message: `Floating PnL is currently ${trade.unrealizedPnl}. Apex Flow is monitoring protection triggers.`,
+      severity: "INFO",
+    });
+  }
+
+  if (trade.breakEvenActive) {
+    log.push({
+      time: trade.lastPriceUpdate || new Date().toISOString(),
+      title: "Break-even protection active",
+      message: "Original position risk has been reduced. The trade is now protected at entry or better.",
+      severity: "SUCCESS",
+    });
+  }
+
+  if (trade.trailingActive) {
+    log.push({
+      time: trade.lastPriceUpdate || new Date().toISOString(),
+      title: "Trailing stop active",
+      message: `Trailing stop is active${trade.trailingStopPrice ? ` near ${trade.trailingStopPrice}` : ""}.`,
+      severity: "SUCCESS",
+    });
+  }
+
+  if (Number(trade.protectedProfit || 0) > 0) {
+    log.push({
+      time: trade.lastPriceUpdate || new Date().toISOString(),
+      title: "Protected profit detected",
+      message: `${trade.protectedProfit} is currently protected by the management engine.`,
+      severity: "SUCCESS",
+    });
+  }
+
+  if (trade.reversalRisk === "HIGH") {
+    log.push({
+      time: trade.lastPriceUpdate || new Date().toISOString(),
+      title: "Reversal risk elevated",
+      message: "Market reversal risk is elevated. Apex Flow is monitoring protection rules closely.",
+      severity: "WARNING",
+    });
+  }
+
+  return log.slice(0, 8);
+}
+
+function buildPositionJournalEntry(trade) {
+  const lifecycleStage = getJournalLifecycleStage(trade);
+
+  return {
+    symbol: trade.symbol,
+    side: trade.side || "LONG",
+    entryPrice: trade.entryPrice,
+    currentPrice: trade.currentPrice ?? trade.entryPrice,
+    quantity: trade.quantity ?? 1,
+    entryTime: trade.entryTime,
+    openDuration: formatJournalDuration(trade.durationSeconds),
+    durationSeconds: trade.durationSeconds || 0,
+    highestPrice: trade.highestPrice ?? trade.currentPrice ?? trade.entryPrice,
+    lowestPrice: trade.lowestPrice ?? trade.currentPrice ?? trade.entryPrice,
+    unrealizedPnl: Number(trade.unrealizedPnl || 0),
+    pnlPercent: Number(trade.pnlPercent || 0),
+    protectedProfit: Number(trade.protectedProfit || 0),
+    breakEvenActive: Boolean(trade.breakEvenActive),
+    trailingActive: Boolean(trade.trailingActive),
+    trailingStopPrice: trade.trailingStopPrice ?? null,
+    stopLossPrice: trade.stopLossPrice ?? null,
+    takeProfitPrice: trade.takeProfitPrice ?? null,
+    health: trade.health || "OPEN",
+    riskState: trade.riskState || "CONTROLLED",
+    managerAction: trade.managerAction || "MONITOR",
+    lifecycle: trade.lifecycle || trade.status || "OPEN",
+    lifecycleStage,
+    plainEnglishStatus: getPlainEnglishTradeStatus(trade),
+    timeline: buildTradeTimeline(trade),
+    decisionLog: buildDecisionLog(trade),
+  };
+}
+
+function getPositionJournal() {
+  sanitizeActiveTrades("GET_POSITION_JOURNAL");
+  updateAllTradeLifecycles();
+
+  const activeList = getActiveTradeList();
+  const fallbackList = activeList.length > 0 ? activeList : Object.values(activeTrades).map(enrichActiveTrade);
+  const positions = fallbackList.map(buildPositionJournalEntry);
+  const protectedPositions = positions.filter(
+    (position) => position.breakEvenActive || position.trailingActive
+  ).length;
+  const trailingPositions = positions.filter(
+    (position) => position.trailingActive
+  ).length;
+  const protectedProfitTotal = positions.reduce(
+    (sum, position) => sum + Number(position.protectedProfit || 0),
+    0
+  );
+
+  return {
+    time: new Date().toISOString(),
+    activeCount: positions.length,
+    protectedPositions,
+    trailingPositions,
+    protectedProfitTotal: Number(protectedProfitTotal.toFixed(2)),
+    positions,
+    summary:
+      positions.length === 0
+        ? "No active trades. Apex Flow is waiting for the next valid TradingView signal."
+        : protectedPositions > 0
+          ? "At least one trade is protected and being actively managed."
+          : "Active trades are open and waiting for protection triggers.",
   };
 }
 
@@ -3858,6 +4317,7 @@ module.exports = {
   getPortfolioSummary,
   getAnalytics,
   getPositionManagement,
+  getPositionJournal,
   getPositionTelemetry,
   getPortfolioDefenseProfile,
   getExecutionEnvironment,

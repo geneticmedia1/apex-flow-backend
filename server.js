@@ -16,6 +16,7 @@ const {
   getPortfolioSummary,
   getAnalytics,
   getPositionManagement,
+  getPositionJournal,
   getPositionTelemetry,
   getRiskStatus,
   synchronizeExchangeBalances,
@@ -58,6 +59,7 @@ app.use(express.json());
 let latestSignal = null;
 let signalHistory = [];
 let runtimeEventHistory = [];
+let runtimeEventDedup = {};
 
 async function restoreDatabaseState() {
   console.log("Loading previous database state...");
@@ -84,11 +86,34 @@ async function restoreDatabaseState() {
 
 
 function createRuntimeEvent(category, severity, message, payload = {}) {
+  const normalizedCategory = String(category || "SYSTEM").toUpperCase();
+  const normalizedSeverity = String(severity || "INFO").toUpperCase();
+  const normalizedMessage = String(message || "Runtime event");
+  const dedupKey = `${normalizedCategory}|${normalizedSeverity}|${normalizedMessage}`;
+  const nowMs = Date.now();
+  const existingDedup = runtimeEventDedup[dedupKey];
+
+  if (existingDedup && nowMs - existingDedup.lastSeen < 60000) {
+    existingDedup.count += 1;
+    existingDedup.lastSeen = nowMs;
+
+    if (existingDedup.event) {
+      existingDedup.event.duplicateCount = existingDedup.count;
+      existingDedup.event.payload = {
+        ...(existingDedup.event.payload || {}),
+        duplicateCount: existingDedup.count,
+        duplicateSuppressed: true,
+      };
+    }
+
+    return existingDedup.event;
+  }
+
   const event = {
     time: new Date().toISOString(),
-    category: String(category || "SYSTEM").toUpperCase(),
-    severity: String(severity || "INFO").toUpperCase(),
-    message,
+    category: normalizedCategory,
+    severity: normalizedSeverity,
+    message: normalizedMessage,
     symbol: payload.symbol || payload.signal?.symbol || null,
     action: payload.action || payload.signal?.action || null,
     setup: payload.setup || payload.signal?.setup || null,
@@ -108,6 +133,12 @@ function createRuntimeEvent(category, severity, message, payload = {}) {
   }
 
   io.emit("runtime-event", event);
+
+  runtimeEventDedup[dedupKey] = {
+    lastSeen: nowMs,
+    count: 1,
+    event,
+  };
 
   return event;
 }
@@ -181,6 +212,7 @@ function emitDashboardUpdates(signal = null, processResult = null) {
   io.emit("active-trade-update", getActiveTrade());
   io.emit("active-trades-update", getActiveTradeListForDashboard());
   io.emit("position-management-update", getPositionManagement());
+  io.emit("position-journal-update", getPositionJournal());
   io.emit("position-telemetry-update", getPositionTelemetry());
   io.emit("trade-history-update", getTradeHistory());
   io.emit("rejected-signals-update", getRejectedSignals());
@@ -189,6 +221,55 @@ function emitDashboardUpdates(signal = null, processResult = null) {
   io.emit("analytics-update", getAnalytics());
   io.emit("risk-update", getRiskStatus());
   io.emit("runtime-events-update", runtimeEventHistory);
+}
+
+function performPaperReset() {
+  signalHistory = [];
+  runtimeEventHistory = [];
+  runtimeEventDedup = {};
+  latestSignal = null;
+
+  if (typeof clearDatabase === "function") {
+    clearDatabase();
+  }
+
+  const resetResult = resetPaperState();
+
+  const resetPayload = {
+    ok: true,
+    message: "Paper state reset",
+    reset: resetResult,
+    account: {
+      balance: 10000,
+      equity: 10000,
+      realizedBalance: 10000,
+      unrealizedPnl: 0,
+      wins: 0,
+      losses: 0,
+      totalTrades: 0,
+      activeTradeCount: 0,
+    },
+    activeTrade: null,
+    activeTrades: [],
+    tradeHistory: [],
+    rejectedSignals: [],
+  };
+
+  io.emit("paper-reset", resetPayload);
+  io.emit("runtime-events-update", runtimeEventHistory);
+  emitDashboardUpdates();
+
+  setTimeout(() => {
+    io.emit("paper-reset", resetPayload);
+    emitDashboardUpdates();
+  }, 300);
+
+  setTimeout(() => {
+    io.emit("paper-reset", resetPayload);
+    emitDashboardUpdates();
+  }, 1200);
+
+  return resetPayload;
 }
 
 app.post("/webhook", (req, res) => {
@@ -256,6 +337,7 @@ app.post("/webhook", (req, res) => {
     signal,
     account: getAccount(),
     positions: getPositionManagement(),
+    positionJournal: getPositionJournal(),
     telemetry: getPositionTelemetry(),
     risk: getRiskStatus(),
   });
@@ -266,10 +348,17 @@ app.get("/", (req, res) => {
 });
 
 app.get("/status", (req, res) => {
+  const brokerStatus = getBrokerStatus();
+
   res.json({
     status: "online",
+    backendOnline: true,
+    webhookHealthy: true,
     signalsStored: signalHistory.length,
     latestSignal,
+    lastSignalTime: latestSignal?.time || null,
+    brokerMode: brokerStatus?.mode || "paper",
+    brokerConnected: brokerStatus?.connected !== false,
   });
 });
 
@@ -299,6 +388,10 @@ app.get("/active-trades-map", (req, res) => {
 
 app.get("/positions", (req, res) => {
   res.json(getPositionManagement());
+});
+
+app.get("/position-journal", (req, res) => {
+  res.json(getPositionJournal());
 });
 
 app.get("/telemetry", (req, res) => {
@@ -443,22 +536,23 @@ app.post("/runtime/recovery/reset", (req, res) => {
 });
 
 app.post("/admin/reset-paper", (req, res) => {
-  signalHistory = [];
-  latestSignal = null;
-
-  resetPaperState();
-
-  if (typeof clearDatabase === "function") {
-    clearDatabase();
-  }
-
-  emitDashboardUpdates();
-
-  res.json({
-    ok: true,
-    message: "Paper state reset",
-  });
+  res.json(performPaperReset());
 });
+
+
+
+/* =====================================================
+   COMPATIBILITY ADMIN ROUTES
+===================================================== */
+
+app.get("/reset-paper", (req, res) => {
+  res.json(performPaperReset());
+});
+
+app.get("/clear-database", (req, res) => {
+  res.json(performPaperReset());
+});
+
 
 const PORT = process.env.PORT || 3000;
 
@@ -472,6 +566,7 @@ setInterval(() => {
   io.emit("account-update", getAccount());
   io.emit("active-trades-update", getActiveTradeListForDashboard());
   io.emit("position-management-update", getPositionManagement());
+  io.emit("position-journal-update", getPositionJournal());
   io.emit("position-telemetry-update", getPositionTelemetry());
   io.emit("portfolio-update", getPortfolioSummary());
   io.emit("risk-update", getRiskStatus());
