@@ -84,7 +84,7 @@ const POSITION_CONTROL = {
   riskPerTradePercent: 1,
   defaultStopLossPercent: 2,
   defaultTakeProfitPercent: 4,
-  maxExposurePercent: 50,
+  maxExposurePercent: 100,
 
   trailingStopPercent: 1.2,
   breakEvenTriggerPercent: 1.5,
