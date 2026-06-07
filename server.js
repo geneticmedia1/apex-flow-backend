@@ -43,6 +43,9 @@ const {
   updateAutoCloseConfig,
   forceCloseTrade,
   runAutoCloseCheck,
+  consumeAutonomousManagerEvents,
+  updateLatestPrice,
+  updateAllTradeLifecycles,
 } = require("./tradeEngine");
 
 const { saveSignal, loadSignals, saveRuntimeEvent, loadRuntimeEvents, clearDatabase } = require("./database");
@@ -64,6 +67,107 @@ let latestSignal = null;
 let signalHistory = [];
 let runtimeEventHistory = [];
 let runtimeEventDedup = {};
+
+
+/* =====================================================
+   v11.2.1 — LIVE PRICE SYNC FALLBACK
+   Keeps paper positions marked to live public market prices.
+   TradingView chart movement is visual only; this restores the
+   backend price path that floating PnL, lifecycle, protection,
+   break-even, and trailing logic depend on.
+===================================================== */
+const PRICE_SYNC_SYMBOL_MAP = {
+  BTCUSD: "BTCUSDT",
+  SOLUSD: "SOLUSDT",
+  ETHUSD: "ETHUSDT",
+};
+
+let priceSyncInFlight = false;
+let lastPriceSyncAt = null;
+let priceSyncErrorCount = 0;
+
+function toBinanceSymbol(symbol = "") {
+  const normalized = String(symbol || "").toUpperCase().replace(/[^A-Z]/g, "");
+
+  if (PRICE_SYNC_SYMBOL_MAP[normalized]) {
+    return PRICE_SYNC_SYMBOL_MAP[normalized];
+  }
+
+  if (normalized.endsWith("USD")) {
+    return `${normalized.slice(0, -3)}USDT`;
+  }
+
+  return normalized;
+}
+
+async function fetchBinanceTickerPrice(binanceSymbol) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 3500);
+
+  try {
+    const response = await fetch(
+      `https://api.binance.com/api/v3/ticker/price?symbol=${encodeURIComponent(binanceSymbol)}`,
+      { signal: controller.signal }
+    );
+
+    if (!response.ok) {
+      throw new Error(`Binance ticker ${response.status}`);
+    }
+
+    const payload = await response.json();
+    const price = Number(payload.price || 0);
+
+    if (!price || Number.isNaN(price)) {
+      throw new Error(`Invalid ticker price for ${binanceSymbol}`);
+    }
+
+    return price;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+async function refreshOpenPositionPrices() {
+  if (priceSyncInFlight || typeof updateLatestPrice !== "function") {
+    return;
+  }
+
+  const activeTrades = getActiveTrades();
+  const symbols = Object.keys(activeTrades || {});
+
+  if (symbols.length === 0) {
+    return;
+  }
+
+  priceSyncInFlight = true;
+
+  try {
+    await Promise.all(
+      symbols.map(async (symbol) => {
+        const binanceSymbol = toBinanceSymbol(symbol);
+        const price = await fetchBinanceTickerPrice(binanceSymbol);
+        updateLatestPrice(symbol, price);
+      })
+    );
+
+    if (typeof updateAllTradeLifecycles === "function") {
+      updateAllTradeLifecycles();
+    }
+
+    lastPriceSyncAt = new Date().toISOString();
+    priceSyncErrorCount = 0;
+    emitDashboardUpdates();
+  } catch (err) {
+    priceSyncErrorCount += 1;
+
+    // Avoid noisy logs on brief API/network interruptions.
+    if (priceSyncErrorCount === 1 || priceSyncErrorCount % 12 === 0) {
+      console.warn("Apex price sync warning:", err.message);
+    }
+  } finally {
+    priceSyncInFlight = false;
+  }
+}
 
 async function restoreDatabaseState() {
   console.log("Loading previous database state...");
@@ -217,7 +321,27 @@ function emitLifecycleEvents(signal, processResult) {
 
 }
 
+function emitAutonomousManagerEvents() {
+  if (typeof consumeAutonomousManagerEvents !== "function") {
+    return [];
+  }
+
+  const events = consumeAutonomousManagerEvents();
+
+  events.forEach((event) => {
+    createRuntimeEvent(
+      event.category || "LIFECYCLE",
+      event.severity || "SUCCESS",
+      event.message || "Autonomous manager event",
+      event.payload || event
+    );
+  });
+
+  return events;
+}
+
 function emitDashboardUpdates(signal = null, processResult = null) {
+  emitAutonomousManagerEvents();
   if (signal) {
     io.emit("new-signal", signal);
   }
@@ -657,6 +781,10 @@ restoreDatabaseState().then(() => {
 });
 
 setInterval(() => {
+  refreshOpenPositionPrices();
+}, 5000);
+
+setInterval(() => {
   const autoCloseResult = runAutoCloseCheck();
 
   if (autoCloseResult.enabled && autoCloseResult.closed.length > 0) {
@@ -669,6 +797,8 @@ setInterval(() => {
       );
     });
   }
+
+  emitAutonomousManagerEvents();
 
   io.emit("account-update", getAccount());
   io.emit("active-trades-update", getActiveTradeListForDashboard());

@@ -127,6 +127,117 @@ const AUTONOMOUS_POSITION_MANAGER = {
 };
 
 
+const AUTONOMOUS_MANAGER_EVENTS = [];
+
+function queueAutonomousManagerEvent(category, severity, message, payload = {}) {
+  const event = {
+    time: new Date().toISOString(),
+    category: String(category || "LIFECYCLE").toUpperCase(),
+    severity: String(severity || "INFO").toUpperCase(),
+    message: String(message || "Autonomous position manager event"),
+    symbol: payload.symbol || payload.trade?.symbol || null,
+    action: payload.action || null,
+    setup: payload.setup || payload.trade?.setup || null,
+    payload,
+  };
+
+  AUTONOMOUS_MANAGER_EVENTS.unshift(event);
+
+  if (AUTONOMOUS_MANAGER_EVENTS.length > 250) {
+    AUTONOMOUS_MANAGER_EVENTS.pop();
+  }
+
+  writeExecutionAudit("AUTONOMOUS_MANAGER_EVENT", event);
+
+  return event;
+}
+
+function consumeAutonomousManagerEvents() {
+  return AUTONOMOUS_MANAGER_EVENTS.splice(0, AUTONOMOUS_MANAGER_EVENTS.length).reverse();
+}
+
+function snapshotProtectionState(trade) {
+  return {
+    breakEvenActive: Boolean(trade?.breakEvenActive),
+    trailingActive: Boolean(trade?.trailingActive),
+    protectedProfit: Number(trade?.protectedProfit || 0),
+    profitLockTier: String(trade?.profitLockTier || "NONE"),
+    protectionLevel: String(trade?.protectionLevel || "NONE"),
+    lifecycle: String(trade?.lifecycle || trade?.status || "OPEN"),
+  };
+}
+
+function emitProtectionDeltaEvents(trade, beforeState) {
+  if (!trade || !beforeState) return;
+
+  const symbol = trade.symbol || "UNKNOWN";
+  const pnlPercent = Number(trade.pnlPercent ?? getTradePnlPercent(trade) ?? 0);
+  const protectedProfit = Number(trade.protectedProfit || 0);
+
+  if (!beforeState.breakEvenActive && trade.breakEvenActive) {
+    queueAutonomousManagerEvent(
+      "LIFECYCLE",
+      "SUCCESS",
+      `${symbol} break-even protection activated`,
+      {
+        symbol,
+        trade: enrichActiveTrade(trade),
+        pnlPercent: Number(pnlPercent.toFixed(2)),
+        protectionLevel: trade.protectionLevel || "BREAK_EVEN",
+      }
+    );
+  }
+
+  if (
+    String(beforeState.profitLockTier || "NONE") !== String(trade.profitLockTier || "NONE") &&
+    String(trade.profitLockTier || "NONE") !== "NONE"
+  ) {
+    queueAutonomousManagerEvent(
+      "LIFECYCLE",
+      "SUCCESS",
+      `${symbol} profit lock tier activated: ${trade.profitLockTier}`,
+      {
+        symbol,
+        trade: enrichActiveTrade(trade),
+        pnlPercent: Number(pnlPercent.toFixed(2)),
+        profitLockTier: trade.profitLockTier,
+        protectedProfit,
+      }
+    );
+  }
+
+  if (!beforeState.trailingActive && trade.trailingActive) {
+    queueAutonomousManagerEvent(
+      "LIFECYCLE",
+      "SUCCESS",
+      `${symbol} trailing lock activated`,
+      {
+        symbol,
+        trade: enrichActiveTrade(trade),
+        pnlPercent: Number(pnlPercent.toFixed(2)),
+        trailingStopPrice: trade.trailingStopPrice,
+        protectedProfit,
+      }
+    );
+  }
+
+  if (protectedProfit > Number(beforeState.protectedProfit || 0) + 0.01) {
+    queueAutonomousManagerEvent(
+      "EXECUTION",
+      "SUCCESS",
+      `${symbol} protected profit increased to $${protectedProfit.toFixed(2)}`,
+      {
+        symbol,
+        trade: enrichActiveTrade(trade),
+        protectedProfit,
+        previousProtectedProfit: Number(beforeState.protectedProfit || 0),
+        pnlPercent: Number(pnlPercent.toFixed(2)),
+      }
+    );
+  }
+}
+
+
 
 const AUTO_CLOSE_CONFIG = {
   enabled: false,
@@ -1367,13 +1478,24 @@ function getPositionRiskStateFromScore(score) {
 }
 
 function applyAutonomousPositionManager(trade) {
-  if (!AUTONOMOUS_POSITION_MANAGER.enabled || !trade || trade.side !== "LONG") {
+  if (!AUTONOMOUS_POSITION_MANAGER.enabled || !trade) {
     return trade;
   }
 
+  const side = String(trade.side || "LONG").toUpperCase();
   const entryPrice = Number(trade.entryPrice || 0);
+  const currentPrice = Number(
+    latestPrices[trade.symbol] ??
+    trade.currentPrice ??
+    trade.entryPrice
+  );
+  const quantity = Number(trade.quantity || 1);
   const pnlPercent = getTradePnlPercent(trade);
   const activeTier = getActiveProfitLockTier(pnlPercent);
+
+  if (!entryPrice || !currentPrice || !Number.isFinite(entryPrice) || !Number.isFinite(currentPrice)) {
+    return trade;
+  }
 
   if (pnlPercent >= AUTONOMOUS_POSITION_MANAGER.breakEvenTriggerPercent && !trade.breakEvenActive) {
     trade.stopLossPrice = entryPrice;
@@ -1383,10 +1505,17 @@ function applyAutonomousPositionManager(trade) {
     trade.status = "PROTECTED";
   }
 
-  if (activeTier && entryPrice > 0) {
-    const lockedStop = Number((entryPrice * (1 + activeTier.lockPercent / 100)).toFixed(2));
+  if (activeTier) {
+    const lockedStop = side === "SHORT"
+      ? Number((entryPrice * (1 - activeTier.lockPercent / 100)).toFixed(2))
+      : Number((entryPrice * (1 + activeTier.lockPercent / 100)).toFixed(2));
 
-    if (!trade.stopLossPrice || lockedStop > Number(trade.stopLossPrice)) {
+    const existingStop = Number(trade.stopLossPrice || 0);
+    const improvesStop = side === "SHORT"
+      ? !existingStop || lockedStop < existingStop
+      : !existingStop || lockedStop > existingStop;
+
+    if (improvesStop) {
       trade.stopLossPrice = lockedStop;
       trade.trailingStopPrice = lockedStop;
       trade.trailingActive = true;
@@ -1394,7 +1523,9 @@ function applyAutonomousPositionManager(trade) {
       trade.protectionLevel = "PROFIT_LOCK";
       trade.lifecycle = "TRAILING";
       trade.status = "TRAILING";
-      trade.protectedProfit = Number(((lockedStop - entryPrice) * Number(trade.quantity || 1)).toFixed(2));
+      trade.protectedProfit = side === "SHORT"
+        ? Number(((entryPrice - lockedStop) * quantity).toFixed(2))
+        : Number(((lockedStop - entryPrice) * quantity).toFixed(2));
     }
   }
 
@@ -1638,6 +1769,7 @@ function updateTrailingStop(trade) {
         trade.trailingStopPrice;
 
       trade.trailingActive = true;
+      trade.profitLockTier = trade.profitLockTier || `${volatilityProfile.profitLockTriggerPercent}% → trailing`;
 
       trade.protectedProfit = Number(
         (
@@ -1698,8 +1830,11 @@ function updateTradeLifecycle(trade, marketPrice) {
   trade.unrealizedPnl = Number(unrealizedPnl.toFixed(2));
   trade.durationSeconds = calculateTradeDurationSeconds(trade);
 
+  const protectionBefore = snapshotProtectionState(trade);
+
   updateTrailingStop(trade);
   applyAutonomousPositionManager(trade);
+  emitProtectionDeltaEvents(trade, protectionBefore);
 
   if (
     trade.stopLossPrice &&
@@ -2215,6 +2350,7 @@ function processSignal(signal) {
       trailingActive: false,
 
       protectedProfit: 0,
+      profitLockTier: "NONE",
 
       breakEvenActive: false,
 
@@ -4408,6 +4544,9 @@ function buildPositionJournalEntry(trade) {
     unrealizedPnl: Number(trade.unrealizedPnl || 0),
     pnlPercent: Number(trade.pnlPercent || 0),
     protectedProfit: Number(trade.protectedProfit || 0),
+    profitLockTier: trade.profitLockTier || "NONE",
+    protectionLevel: trade.protectionLevel || "NONE",
+    adaptiveTrailingPercent: trade.adaptiveTrailingPercent ?? null,
     breakEvenActive: Boolean(trade.breakEvenActive),
     trailingActive: Boolean(trade.trailingActive),
     trailingStopPrice: trade.trailingStopPrice ?? null,
@@ -4459,6 +4598,8 @@ function getPositionJournal() {
 }
 
 module.exports = {
+  updateLatestPrice,
+  consumeAutonomousManagerEvents,
   runAutoCloseCheck,
   forceCloseTrade,
   updateAutoCloseConfig,
