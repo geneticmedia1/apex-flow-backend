@@ -39,6 +39,10 @@ const {
   restartRuntimeSystems,
   resetRuntimeRecoverySystems,
   getRuntimeControlStatus,
+  getAutoCloseConfig,
+  updateAutoCloseConfig,
+  forceCloseTrade,
+  runAutoCloseCheck,
 } = require("./tradeEngine");
 
 const { saveSignal, loadSignals, saveRuntimeEvent, loadRuntimeEvents, clearDatabase } = require("./database");
@@ -197,6 +201,20 @@ function emitLifecycleEvents(signal, processResult) {
       { signal, result: processResult }
     );
   }
+
+  if (processResult.action === "AUTO_CLOSED") {
+    const closedCount = Array.isArray(processResult.autoClose?.closed)
+      ? processResult.autoClose.closed.length
+      : 0;
+
+    createRuntimeEvent(
+      "EXECUTION",
+      "WARNING",
+      `${signal.symbol} auto-close protection closed ${closedCount} position${closedCount === 1 ? "" : "s"}`,
+      { signal, result: processResult }
+    );
+  }
+
 }
 
 function emitDashboardUpdates(signal = null, processResult = null) {
@@ -221,6 +239,7 @@ function emitDashboardUpdates(signal = null, processResult = null) {
   io.emit("analytics-update", getAnalytics());
   io.emit("risk-update", getRiskStatus());
   io.emit("runtime-events-update", runtimeEventHistory);
+  io.emit("auto-close-update", getAutoCloseConfig());
 }
 
 function performPaperReset() {
@@ -545,6 +564,81 @@ app.post("/admin/reset-paper", (req, res) => {
    COMPATIBILITY ADMIN ROUTES
 ===================================================== */
 
+
+app.get("/auto-close", (req, res) => {
+  res.json(getAutoCloseConfig());
+});
+
+app.post("/auto-close", (req, res) => {
+  const config = updateAutoCloseConfig(req.body || {});
+
+  createRuntimeEvent(
+    "SYSTEM",
+    config.enabled ? "SUCCESS" : "INFO",
+    `Auto-close protection ${config.enabled ? "enabled" : "disabled"}`,
+    { config }
+  );
+
+  emitDashboardUpdates();
+
+  res.json({
+    ok: true,
+    config,
+  });
+});
+
+app.post("/force-close", (req, res) => {
+  const symbol = req.body?.symbol || "BTCUSD";
+  const price = req.body?.price;
+  const reason = req.body?.reason || "MANUAL_FORCE_CLOSE";
+
+  const result = forceCloseTrade(symbol, price, reason);
+
+  createRuntimeEvent(
+    "EXECUTION",
+    result.accepted ? "WARNING" : "INFO",
+    result.accepted
+      ? `${result.symbol} manually force-closed from command centre`
+      : `${result.symbol} force-close skipped: ${result.reason}`,
+    { result }
+  );
+
+  emitDashboardUpdates(null, result);
+
+  res.json({
+    ok: result.accepted,
+    result,
+    account: getAccount(),
+    positions: getPositionManagement(),
+  });
+});
+
+app.get("/force-close", (req, res) => {
+  const symbol = req.query.symbol || "BTCUSD";
+  const price = req.query.price;
+  const reason = req.query.reason || "MANUAL_FORCE_CLOSE_BROWSER";
+
+  const result = forceCloseTrade(symbol, price, reason);
+
+  createRuntimeEvent(
+    "EXECUTION",
+    result.accepted ? "WARNING" : "INFO",
+    result.accepted
+      ? `${result.symbol} manually force-closed from browser endpoint`
+      : `${result.symbol} force-close skipped: ${result.reason}`,
+    { result }
+  );
+
+  emitDashboardUpdates(null, result);
+
+  res.json({
+    ok: result.accepted,
+    result,
+    account: getAccount(),
+    positions: getPositionManagement(),
+  });
+});
+
 app.get("/reset-paper", (req, res) => {
   res.json(performPaperReset());
 });
@@ -563,6 +657,19 @@ restoreDatabaseState().then(() => {
 });
 
 setInterval(() => {
+  const autoCloseResult = runAutoCloseCheck();
+
+  if (autoCloseResult.enabled && autoCloseResult.closed.length > 0) {
+    autoCloseResult.closed.forEach((result) => {
+      createRuntimeEvent(
+        "EXECUTION",
+        "WARNING",
+        `${result.symbol} auto-close protection triggered: ${result.reason}`,
+        { result }
+      );
+    });
+  }
+
   io.emit("account-update", getAccount());
   io.emit("active-trades-update", getActiveTradeListForDashboard());
   io.emit("position-management-update", getPositionManagement());
@@ -571,4 +678,5 @@ setInterval(() => {
   io.emit("portfolio-update", getPortfolioSummary());
   io.emit("risk-update", getRiskStatus());
   io.emit("runtime-events-update", runtimeEventHistory);
+  io.emit("auto-close-update", getAutoCloseConfig());
 }, 5000);

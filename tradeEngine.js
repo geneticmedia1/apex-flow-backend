@@ -126,6 +126,166 @@ const AUTONOMOUS_POSITION_MANAGER = {
   enabled: true,
 };
 
+
+
+const AUTO_CLOSE_CONFIG = {
+  enabled: false,
+  maxLossPercent: 2,
+  takeProfitPercent: 4,
+  maxDurationMinutes: 0,
+  closeOnBreakEven: false,
+};
+
+function normalizeAutoCloseNumber(value, fallback) {
+  const numeric = Number(value);
+  return Number.isFinite(numeric) && numeric >= 0 ? numeric : fallback;
+}
+
+function getAutoCloseConfig() {
+  return { ...AUTO_CLOSE_CONFIG };
+}
+
+function updateAutoCloseConfig(patch = {}) {
+  if (patch.enabled !== undefined) {
+    AUTO_CLOSE_CONFIG.enabled =
+      patch.enabled === true ||
+      patch.enabled === "true" ||
+      patch.enabled === "ON" ||
+      patch.enabled === "on";
+  }
+
+  if (patch.maxLossPercent !== undefined) {
+    AUTO_CLOSE_CONFIG.maxLossPercent =
+      normalizeAutoCloseNumber(patch.maxLossPercent, AUTO_CLOSE_CONFIG.maxLossPercent);
+  }
+
+  if (patch.takeProfitPercent !== undefined) {
+    AUTO_CLOSE_CONFIG.takeProfitPercent =
+      normalizeAutoCloseNumber(patch.takeProfitPercent, AUTO_CLOSE_CONFIG.takeProfitPercent);
+  }
+
+  if (patch.maxDurationMinutes !== undefined) {
+    AUTO_CLOSE_CONFIG.maxDurationMinutes =
+      normalizeAutoCloseNumber(patch.maxDurationMinutes, AUTO_CLOSE_CONFIG.maxDurationMinutes);
+  }
+
+  if (patch.closeOnBreakEven !== undefined) {
+    AUTO_CLOSE_CONFIG.closeOnBreakEven =
+      patch.closeOnBreakEven === true ||
+      patch.closeOnBreakEven === "true" ||
+      patch.closeOnBreakEven === "ON" ||
+      patch.closeOnBreakEven === "on";
+  }
+
+  writeExecutionAudit("AUTO_CLOSE_CONFIG_UPDATED", AUTO_CLOSE_CONFIG);
+
+  return getAutoCloseConfig();
+}
+
+function getTradePnlPercent(trade) {
+  if (!trade) return 0;
+
+  const entryPrice = Number(trade.entryPrice || 0);
+  const currentPrice = Number(
+    latestPrices[trade.symbol] ??
+    trade.currentPrice ??
+    trade.entryPrice
+  );
+
+  if (!entryPrice || !currentPrice || !Number.isFinite(entryPrice) || !Number.isFinite(currentPrice)) {
+    return 0;
+  }
+
+  const raw =
+    trade.side === "SHORT"
+      ? ((entryPrice - currentPrice) / entryPrice) * 100
+      : ((currentPrice - entryPrice) / entryPrice) * 100;
+
+  return Number(raw.toFixed(4));
+}
+
+function forceCloseTrade(symbol = "BTCUSD", price = null, reason = "MANUAL_FORCE_CLOSE") {
+  const normalizedSymbol = normalizeSymbol(symbol);
+  const trade = activeTrades[normalizedSymbol];
+
+  if (!trade) {
+    return {
+      accepted: false,
+      action: "NO_POSITION",
+      symbol: normalizedSymbol,
+      reason: "No active trade to close for this symbol",
+    };
+  }
+
+  const exitPrice = Number(price || latestPrices[normalizedSymbol] || trade.currentPrice || trade.entryPrice);
+  const closedTrade = closeTradeBySymbol(normalizedSymbol, exitPrice, reason);
+
+  recordEquityPoint(normalizedSymbol);
+
+  writeExecutionAudit("FORCE_CLOSE_EXECUTED", {
+    symbol: normalizedSymbol,
+    price: exitPrice,
+    reason,
+    pnl: closedTrade?.pnl,
+  });
+
+  return {
+    accepted: true,
+    action: "CLOSED",
+    symbol: normalizedSymbol,
+    reason,
+    trade: closedTrade,
+  };
+}
+
+function runAutoCloseCheck() {
+  if (!AUTO_CLOSE_CONFIG.enabled) {
+    return {
+      enabled: false,
+      closed: [],
+      config: getAutoCloseConfig(),
+    };
+  }
+
+  const closed = [];
+
+  Object.values(activeTrades || {}).forEach((trade) => {
+    const pnlPercent = getTradePnlPercent(trade);
+    const durationMinutes = calculateTradeDurationSeconds(trade) / 60;
+
+    let reason = null;
+
+    if (AUTO_CLOSE_CONFIG.maxLossPercent > 0 && pnlPercent <= -AUTO_CLOSE_CONFIG.maxLossPercent) {
+      reason = `AUTO_CLOSE_MAX_LOSS_${AUTO_CLOSE_CONFIG.maxLossPercent}%`;
+    } else if (AUTO_CLOSE_CONFIG.takeProfitPercent > 0 && pnlPercent >= AUTO_CLOSE_CONFIG.takeProfitPercent) {
+      reason = `AUTO_CLOSE_TAKE_PROFIT_${AUTO_CLOSE_CONFIG.takeProfitPercent}%`;
+    } else if (AUTO_CLOSE_CONFIG.maxDurationMinutes > 0 && durationMinutes >= AUTO_CLOSE_CONFIG.maxDurationMinutes) {
+      reason = `AUTO_CLOSE_MAX_DURATION_${AUTO_CLOSE_CONFIG.maxDurationMinutes}M`;
+    } else if (AUTO_CLOSE_CONFIG.closeOnBreakEven && trade.breakEvenActive && pnlPercent >= 0) {
+      reason = "AUTO_CLOSE_BREAK_EVEN_PROTECTED";
+    }
+
+    if (reason) {
+      const result = forceCloseTrade(
+        trade.symbol,
+        latestPrices[trade.symbol] || trade.currentPrice || trade.entryPrice,
+        reason
+      );
+
+      if (result.accepted) {
+        closed.push(result);
+      }
+    }
+  });
+
+  return {
+    enabled: true,
+    closed,
+    config: getAutoCloseConfig(),
+  };
+}
+
+
 const PRODUCTION_RUNTIME = {
   environment:
     process.env.NODE_ENV || "development",
@@ -1976,6 +2136,19 @@ function processSignal(signal) {
 
     if (trade) {
       updateTradeLifecycle(trade, price);
+    }
+
+    const autoCloseResult = runAutoCloseCheck();
+
+    if (autoCloseResult.closed.length > 0) {
+      return {
+        accepted: true,
+        action: "AUTO_CLOSED",
+        symbol,
+        price,
+        autoClose: autoCloseResult,
+        positions: getPositionManagement(),
+      };
     }
 
     return {
@@ -4286,6 +4459,10 @@ function getPositionJournal() {
 }
 
 module.exports = {
+  runAutoCloseCheck,
+  forceCloseTrade,
+  updateAutoCloseConfig,
+  getAutoCloseConfig,
   getRuntimeControlStatus,
   resetRuntimeRecoverySystems,
   restartRuntimeSystems,
