@@ -69,103 +69,69 @@ let runtimeEventHistory = [];
 let runtimeEventDedup = {};
 
 
-/* =====================================================
-   v11.2.1 — LIVE PRICE SYNC FALLBACK
-   Keeps paper positions marked to live public market prices.
-   TradingView chart movement is visual only; this restores the
-   backend price path that floating PnL, lifecycle, protection,
-   break-even, and trailing logic depend on.
-===================================================== */
-const PRICE_SYNC_SYMBOL_MAP = {
+const BINANCE_SYMBOL_MAP = {
   BTCUSD: "BTCUSDT",
-  SOLUSD: "SOLUSDT",
+  BTCUSDT: "BTCUSDT",
   ETHUSD: "ETHUSDT",
+  ETHUSDT: "ETHUSDT",
+  SOLUSD: "SOLUSDT",
+  SOLUSDT: "SOLUSDT",
 };
 
-let priceSyncInFlight = false;
-let lastPriceSyncAt = null;
-let priceSyncErrorCount = 0;
+let livePriceSyncRunning = false;
+let lastLivePriceSyncAt = null;
 
-function toBinanceSymbol(symbol = "") {
-  const normalized = String(symbol || "").toUpperCase().replace(/[^A-Z]/g, "");
-
-  if (PRICE_SYNC_SYMBOL_MAP[normalized]) {
-    return PRICE_SYNC_SYMBOL_MAP[normalized];
-  }
-
-  if (normalized.endsWith("USD")) {
-    return `${normalized.slice(0, -3)}USDT`;
-  }
-
-  return normalized;
+function toBinanceTicker(symbol) {
+  const normalized = String(symbol || "").toUpperCase().replace(/[^A-Z0-9]/g, "");
+  return BINANCE_SYMBOL_MAP[normalized] || normalized.replace(/USD$/, "USDT");
 }
 
-async function fetchBinanceTickerPrice(binanceSymbol) {
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 3500);
+async function fetchBinanceTickerPrice(symbol) {
+  const ticker = toBinanceTicker(symbol);
+  const response = await fetch(
+    `https://api.binance.com/api/v3/ticker/price?symbol=${ticker}`
+  );
 
-  try {
-    const response = await fetch(
-      `https://api.binance.com/api/v3/ticker/price?symbol=${encodeURIComponent(binanceSymbol)}`,
-      { signal: controller.signal }
-    );
-
-    if (!response.ok) {
-      throw new Error(`Binance ticker ${response.status}`);
-    }
-
-    const payload = await response.json();
-    const price = Number(payload.price || 0);
-
-    if (!price || Number.isNaN(price)) {
-      throw new Error(`Invalid ticker price for ${binanceSymbol}`);
-    }
-
-    return price;
-  } finally {
-    clearTimeout(timeout);
+  if (!response.ok) {
+    throw new Error(`Binance ticker failed for ${symbol}/${ticker}: ${response.status}`);
   }
+
+  const data = await response.json();
+  const price = Number(data.price);
+
+  if (!price || Number.isNaN(price)) {
+    throw new Error(`Invalid Binance price for ${symbol}/${ticker}`);
+  }
+
+  return price;
 }
 
-async function refreshOpenPositionPrices() {
-  if (priceSyncInFlight || typeof updateLatestPrice !== "function") {
-    return;
-  }
+async function syncLivePricesForActiveTrades() {
+  if (livePriceSyncRunning) return;
 
-  const activeTrades = getActiveTrades();
-  const symbols = Object.keys(activeTrades || {});
+  const activeTrades = getActiveTradeListForDashboard();
+  const symbols = [...new Set(
+    activeTrades
+      .map((trade) => trade.symbol || trade.ticker)
+      .filter(Boolean)
+  )];
 
-  if (symbols.length === 0) {
-    return;
-  }
+  if (symbols.length === 0) return;
 
-  priceSyncInFlight = true;
+  livePriceSyncRunning = true;
 
   try {
-    await Promise.all(
-      symbols.map(async (symbol) => {
-        const binanceSymbol = toBinanceSymbol(symbol);
-        const price = await fetchBinanceTickerPrice(binanceSymbol);
-        updateLatestPrice(symbol, price);
-      })
-    );
+    await Promise.all(symbols.map(async (symbol) => {
+      const price = await fetchBinanceTickerPrice(symbol);
+      updateLatestPrice(symbol, price);
+    }));
 
-    if (typeof updateAllTradeLifecycles === "function") {
-      updateAllTradeLifecycles();
-    }
-
-    lastPriceSyncAt = new Date().toISOString();
-    priceSyncErrorCount = 0;
-    emitDashboardUpdates();
-  } catch (err) {
-    priceSyncErrorCount += 1;
-
-    // Avoid noisy logs on brief API/network interruptions.
-    if (priceSyncErrorCount === 1 || priceSyncErrorCount % 12 === 0) {
-      console.warn("Apex price sync warning:", err.message);
-    }
+    updateAllTradeLifecycles();
+    lastLivePriceSyncAt = new Date().toISOString();
+  } catch (error) {
+    console.error("Live price sync failed:", error.message);
   } finally {
-    priceSyncInFlight = false;
+    livePriceSyncRunning = false;
   }
 }
 
@@ -780,11 +746,9 @@ restoreDatabaseState().then(() => {
   });
 });
 
-setInterval(() => {
-  refreshOpenPositionPrices();
-}, 5000);
+setInterval(async () => {
+  await syncLivePricesForActiveTrades();
 
-setInterval(() => {
   const autoCloseResult = runAutoCloseCheck();
 
   if (autoCloseResult.enabled && autoCloseResult.closed.length > 0) {

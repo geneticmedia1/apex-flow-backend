@@ -4598,7 +4598,6 @@ function getPositionJournal() {
 }
 
 module.exports = {
-  updateLatestPrice,
   consumeAutonomousManagerEvents,
   runAutoCloseCheck,
   forceCloseTrade,
@@ -4651,6 +4650,7 @@ module.exports = {
   calculatePositionSize,
   updateTradeLifecycle,
   updateAllTradeLifecycles,
+  updateLatestPrice,
   getRiskStatus,
   activateEmergencyKillSwitch,
   runLiveReadinessChecks,
