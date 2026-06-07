@@ -1,4 +1,4 @@
-const BrokerInterface = require("./brokerInterface");
+const BrokerInterface = require("./brokerinterface");
 
 class PaperBroker extends BrokerInterface {
   constructor() {
