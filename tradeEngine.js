@@ -16,6 +16,8 @@ const PaperBroker = require("./brokers/paperBroker");
 const BinanceBroker = require("./brokers/binanceBroker");
 const { saveTrade, loadTrades } = require("./database");
 const { calculateAnalytics } = require("./analyticsEngine");
+const fs = require("fs");
+const path = require("path");
 
 const EXECUTION_MODE = "PAPER";
 
@@ -110,6 +112,101 @@ const POSITION_CONTROL = {
     },
   },
 };
+
+const RUNTIME_SETTINGS_FILE = path.join(__dirname, "runtime-settings.json");
+
+function normalizeMaxExposurePercent(value, fallback = POSITION_CONTROL.maxExposurePercent) {
+  const numeric = Number(value);
+
+  if (!Number.isFinite(numeric)) {
+    return fallback;
+  }
+
+  return Math.min(100, Math.max(1, Math.round(numeric)));
+}
+
+function readRuntimeSettings() {
+  try {
+    if (!fs.existsSync(RUNTIME_SETTINGS_FILE)) {
+      return {};
+    }
+
+    const raw = fs.readFileSync(RUNTIME_SETTINGS_FILE, "utf8");
+    return JSON.parse(raw || "{}");
+  } catch (error) {
+    writeExecutionAudit("RUNTIME_SETTINGS_READ_FAILED", {
+      message: error.message,
+    });
+    return {};
+  }
+}
+
+function persistRuntimeSettings() {
+  const settings = {
+    maxExposurePercent: POSITION_CONTROL.maxExposurePercent,
+    updatedAt: new Date().toISOString(),
+  };
+
+  try {
+    fs.writeFileSync(
+      RUNTIME_SETTINGS_FILE,
+      JSON.stringify(settings, null, 2)
+    );
+  } catch (error) {
+    writeExecutionAudit("RUNTIME_SETTINGS_WRITE_FAILED", {
+      message: error.message,
+      settings,
+    });
+  }
+
+  return settings;
+}
+
+function hydrateRuntimeSettings() {
+  const settings = readRuntimeSettings();
+
+  if (settings.maxExposurePercent !== undefined) {
+    POSITION_CONTROL.maxExposurePercent = normalizeMaxExposurePercent(
+      settings.maxExposurePercent,
+      POSITION_CONTROL.maxExposurePercent
+    );
+  }
+}
+
+function getRuntimeRiskSettings() {
+  return {
+    maxExposurePercent: POSITION_CONTROL.maxExposurePercent,
+    options: [25, 50, 75, 100],
+    min: 1,
+    max: 100,
+    source: "runtime",
+  };
+}
+
+function updateMaxExposurePercent(value) {
+  const previousMaxExposurePercent = POSITION_CONTROL.maxExposurePercent;
+  const maxExposurePercent = normalizeMaxExposurePercent(
+    value,
+    previousMaxExposurePercent
+  );
+
+  POSITION_CONTROL.maxExposurePercent = maxExposurePercent;
+  const persisted = persistRuntimeSettings();
+
+  writeExecutionAudit("MAX_EXPOSURE_UPDATED", {
+    previousMaxExposurePercent,
+    maxExposurePercent,
+    persisted,
+  });
+
+  return {
+    ...getRuntimeRiskSettings(),
+    previousMaxExposurePercent,
+    updatedAt: persisted.updatedAt,
+  };
+}
+
+hydrateRuntimeSettings();
 
 
 
@@ -2825,6 +2922,7 @@ function getPositionManagement() {
 
     controls: {
       ...POSITION_CONTROL,
+      runtimeRiskSettings: getRuntimeRiskSettings(),
       note:
         "Default take-profit is shown for planning. Auto TAKE_PROFIT only triggers when takeProfit is explicitly supplied on the BUY signal.",
       trailingEngine:
@@ -2846,6 +2944,7 @@ function getRiskStatus() {
     execution: getExecutionEnvironment(),
     limits: RISK_LIMITS,
     positionControl: POSITION_CONTROL,
+    runtimeRiskSettings: getRuntimeRiskSettings(),
     activeTradeCount,
     maxOpenPositionsReached: activeTradeCount >= RISK_LIMITS.maxOpenPositions,
     todayTradeCount,
@@ -4599,6 +4698,8 @@ function getPositionJournal() {
 
 module.exports = {
   consumeAutonomousManagerEvents,
+  getRuntimeRiskSettings,
+  updateMaxExposurePercent,
   runAutoCloseCheck,
   forceCloseTrade,
   updateAutoCloseConfig,
@@ -4696,4 +4797,3 @@ module.exports.resetRuntimeRecoverySystems =
 
 module.exports.getRuntimeControlStatus =
   getRuntimeControlStatus;
-

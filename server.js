@@ -39,6 +39,8 @@ const {
   restartRuntimeSystems,
   resetRuntimeRecoverySystems,
   getRuntimeControlStatus,
+  getRuntimeRiskSettings,
+  updateMaxExposurePercent,
   getAutoCloseConfig,
   updateAutoCloseConfig,
   forceCloseTrade,
@@ -393,6 +395,7 @@ function emitDashboardUpdates(signal = null, processResult = null) {
   io.emit("risk-update", getRiskStatus());
   io.emit("runtime-events-update", runtimeEventHistory);
   io.emit("auto-close-update", getAutoCloseConfig());
+  io.emit("runtime-risk-settings-update", getRuntimeRiskSettings());
 }
 
 function performPaperReset() {
@@ -712,6 +715,32 @@ app.get("/runtime-controls", (req, res) => {
   res.json(
     getRuntimeControlStatus()
   );
+});
+
+app.get("/runtime/max-exposure", (req, res) => {
+  res.json(
+    getRuntimeRiskSettings()
+  );
+});
+
+app.post("/runtime/max-exposure", (req, res) => {
+  const result = updateMaxExposurePercent(
+    req.body?.maxExposurePercent ?? req.body?.value
+  );
+
+  createRuntimeEvent(
+    "RISK",
+    "SUCCESS",
+    `Max portfolio exposure set to ${result.maxExposurePercent}%`,
+    result
+  );
+
+  io.emit("risk-update", getRiskStatus());
+  io.emit("position-management-update", getPositionManagement());
+  io.emit("runtime-risk-settings-update", result);
+  io.emit("runtime-events-update", runtimeEventHistory);
+
+  res.json(result);
 });
 
 app.post("/runtime/arm", (req, res) => {
