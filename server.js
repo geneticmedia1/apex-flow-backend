@@ -555,12 +555,39 @@ app.get("/active-trades", (req, res) => {
 });
 
 app.get("/price-sync-status", (req, res) => {
+  const activeTrades = getActiveTradeListForDashboard();
+  const activeTradeCount = activeTrades.length;
+  const lastSyncTime = lastLivePriceSyncAt ? Date.parse(lastLivePriceSyncAt) : null;
+  const lastSyncAgeSeconds = lastSyncTime
+    ? Math.max(0, Math.round((Date.now() - lastSyncTime) / 1000))
+    : null;
+  const syncState = livePriceSyncRunning
+    ? "SYNCING"
+    : activeTradeCount > 0
+      ? "IDLE_BETWEEN_CYCLES"
+      : "STANDBY_NO_ACTIVE_TRADES";
+  const statusLabel = livePriceSyncRunning
+    ? "Syncing live prices"
+    : activeTradeCount > 0
+      ? "Monitoring active trades"
+      : "Standing by";
+  const operatorMessage = livePriceSyncRunning
+    ? "Apex Flow is currently refreshing live prices for open paper positions."
+    : activeTradeCount > 0
+      ? "Price sync is not running at this exact moment because the previous cycle has completed. Active trades remain monitored and will refresh on the next scheduled cycle."
+      : "No active trades are open, so the live price sync loop is waiting.";
+
   res.json({
     running: livePriceSyncRunning,
+    syncState,
+    statusLabel,
+    operatorMessage,
+    activeTradeCount,
     lastSyncAt: lastLivePriceSyncAt,
+    lastSyncAgeSeconds,
     lastError: lastLivePriceSyncError,
     lastPrices: lastLivePriceSyncPrices,
-    activeTrades: getActiveTradeListForDashboard(),
+    activeTrades,
   });
 });
 
